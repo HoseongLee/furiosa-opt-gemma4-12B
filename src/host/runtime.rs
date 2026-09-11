@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Aa, C, Df, Ds, E, Gf, Gs, H, Mv, Ns, Pv, Rv, Tf, Ts, W};
@@ -19,21 +18,22 @@ fn gather_pos_embedding(model: &Model, col: usize, row: usize) -> Vec<bf16> {
 }
 
 pub async fn encode_vision_patch(
-    ctx: &mut Context,
+    device: &mut Device,
     model: &Model,
     pixels: &[bf16],
     position: (usize, usize),
-) -> HbmTensor<bf16, Chip, m![H]> {
+) -> Result<HbmTensor<bf16, Chip, m![H]>, Error> {
     assert_eq!(pixels.len(), Rv::SIZE, "vision patch must be Rv-wide");
     let x: HbmTensor<bf16, Chip, m![Rv]> = HostTensor::<bf16, m![Rv]>::from_vec(pixels.to_vec())
-        .to_hbm(&mut ctx.pdma)
-        .await;
+        .to_hbm(&mut device.pdma)
+        .await?;
 
-    let mut patch_out: HbmTensor<bf16, Chip, m![Mv]> = HostTensor::<bf16, m![Mv]>::zero().to_hbm(&mut ctx.pdma).await;
+    let mut patch_out: HbmTensor<bf16, Chip, m![Mv]> =
+        HostTensor::<bf16, m![Mv]>::zero().to_hbm(&mut device.pdma).await?;
     launch(
         ops_vision::patch_embed,
         (
-            ctx,
+            device,
             &x,
             &model.vision.patch_ln1_weight,
             &model.vision.patch_ln1_bias,
@@ -44,19 +44,19 @@ pub async fn encode_vision_patch(
             &mut patch_out,
         ),
     )
-    .await;
+    .await?;
 
     let (col, row) = position;
     let pos_embed: HbmTensor<bf16, Chip, m![Mv]> =
         HostTensor::<bf16, m![Mv]>::from_vec(gather_pos_embedding(model, col, row))
-            .to_hbm(&mut ctx.pdma)
-            .await;
+            .to_hbm(&mut device.pdma)
+            .await?;
 
-    let mut normed: HbmTensor<bf16, Chip, m![Mv]> = HostTensor::<bf16, m![Mv]>::zero().to_hbm(&mut ctx.pdma).await;
+    let mut normed: HbmTensor<bf16, Chip, m![Mv]> = HostTensor::<bf16, m![Mv]>::zero().to_hbm(&mut device.pdma).await?;
     launch(
         ops_vision::add_position_and_norm,
         (
-            ctx,
+            device,
             &patch_out,
             &pos_embed,
             &model.vision.pos_norm_weight,
@@ -64,35 +64,40 @@ pub async fn encode_vision_patch(
             &mut normed,
         ),
     )
-    .await;
+    .await?;
 
-    let mut projected: HbmTensor<bf16, Chip, m![H]> = HostTensor::<bf16, m![H]>::zero().to_hbm(&mut ctx.pdma).await;
+    let mut projected: HbmTensor<bf16, Chip, m![H]> =
+        HostTensor::<bf16, m![H]>::zero().to_hbm(&mut device.pdma).await?;
     launch(
         ops_vision::project_to_text_embedding,
         (
-            ctx,
+            device,
             &unsafe { normed.reshape() },
             &model.vision.embedding_projection_weight,
             &mut projected,
         ),
     )
-    .await;
+    .await?;
 
-    projected
+    Ok(projected)
 }
 
-pub async fn encode_audio_frame(ctx: &mut Context, model: &Model, samples: &[bf16]) -> HbmTensor<bf16, Chip, m![H]> {
+pub async fn encode_audio_frame(
+    device: &mut Device,
+    model: &Model,
+    samples: &[bf16],
+) -> Result<HbmTensor<bf16, Chip, m![H]>, Error> {
     assert_eq!(samples.len(), Aa::SIZE, "audio frame must be Aa-wide");
     let input: HbmTensor<bf16, Chip, m![Aa]> = HostTensor::<bf16, m![Aa]>::from_vec(samples.to_vec())
-        .to_hbm(&mut ctx.pdma)
-        .await;
-    let mut output: HbmTensor<bf16, Chip, m![H]> = HostTensor::<bf16, m![H]>::zero().to_hbm(&mut ctx.pdma).await;
+        .to_hbm(&mut device.pdma)
+        .await?;
+    let mut output: HbmTensor<bf16, Chip, m![H]> = HostTensor::<bf16, m![H]>::zero().to_hbm(&mut device.pdma).await?;
     launch(
         ops_audio::audio_project_frame,
-        (ctx, &input, &model.audio.embedding_projection_weight, &mut output),
+        (device, &input, &model.audio.embedding_projection_weight, &mut output),
     )
-    .await;
-    output
+    .await?;
+    Ok(output)
 }
 
 enum KvCache {
@@ -149,38 +154,43 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub async fn new(ctx: &mut Context, model: &Model) -> Self {
-        let (cos_s, sin_s) = upload_rope(ctx, Ds::SIZE, 10_000.0, Ds::SIZE).await;
-        let (cos_f, sin_f) = upload_rope(ctx, Df::SIZE, 1_000_000.0, 128).await;
-        let mask_s = upload_mask_rows::<m![Ts], _>(ctx, Ts::SIZE, |r, c| if c <= r { 1.0 } else { 0.0 }).await;
+    pub async fn new(device: &mut Device, model: &Model) -> Result<Self, Error> {
+        let (cos_s, sin_s) = upload_rope(device, Ds::SIZE, 10_000.0, Ds::SIZE).await?;
+        let (cos_f, sin_f) = upload_rope(device, Df::SIZE, 1_000_000.0, 128).await?;
+        let mask_s = upload_mask_rows::<m![Ts], _>(device, Ts::SIZE, |r, c| if c <= r { 1.0 } else { 0.0 }).await?;
         let mask_f_line = HostTensor::<f32, m![Tf]>::from_vec(vec![1.0; Tf::SIZE])
-            .to_hbm(&mut ctx.pdma)
-            .await;
-        let mask_f_diag = upload_mask_rows::<m![Tf], _>(ctx, Tf::SIZE, |r, c| if c <= r { 1.0 } else { 0.0 }).await;
+            .to_hbm(&mut device.pdma)
+            .await?;
+        let mask_f_diag =
+            upload_mask_rows::<m![Tf], _>(device, Tf::SIZE, |r, c| if c <= r { 1.0 } else { 0.0 }).await?;
 
         let mut kv_cache = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let cache = match layer {
                 Layer::Sliding(_) => KvCache::Sliding {
-                    k: HostTensor::<bf16, m![Ts, Ns, Ds]>::zero().to_hbm(&mut ctx.pdma).await,
-                    v: HostTensor::<bf16, m![Ts, Ns, Ds]>::zero().to_hbm(&mut ctx.pdma).await,
+                    k: HostTensor::<bf16, m![Ts, Ns, Ds]>::zero()
+                        .to_hbm(&mut device.pdma)
+                        .await?,
+                    v: HostTensor::<bf16, m![Ts, Ns, Ds]>::zero()
+                        .to_hbm(&mut device.pdma)
+                        .await?,
                 },
                 Layer::Full(_) => KvCache::Full {
-                    k: zero_hbm_vec::<bf16, m![Tf, Df]>(ctx, C::SIZE).await,
-                    v: zero_hbm_vec::<bf16, m![Tf, Df]>(ctx, C::SIZE).await,
+                    k: zero_hbm_vec::<bf16, m![Tf, Df]>(device, C::SIZE).await?,
+                    v: zero_hbm_vec::<bf16, m![Tf, Df]>(device, C::SIZE).await?,
                 },
             };
             kv_cache.push(cache);
         }
 
-        let logits = HostTensor::<bf16, m![W]>::zero().to_hbm(&mut ctx.pdma).await;
+        let logits = HostTensor::<bf16, m![W]>::zero().to_hbm(&mut device.pdma).await?;
 
-        let offset_kv_s = zero_offset(ctx).await;
-        let offset_kv_f = zero_offset(ctx).await;
-        let offset_rope_s = zero_offset(ctx).await;
-        let offset_rope_f = zero_offset(ctx).await;
+        let offset_kv_s = zero_offset(device).await?;
+        let offset_kv_f = zero_offset(device).await?;
+        let offset_rope_s = zero_offset(device).await?;
+        let offset_rope_f = zero_offset(device).await?;
 
-        Self {
+        Ok(Self {
             cos_s,
             sin_s,
             cos_f,
@@ -194,23 +204,31 @@ impl Workspace {
             offset_rope_s,
             offset_rope_f,
             logits,
-        }
+        })
     }
 
-    pub fn begin_decode(&mut self) -> Decode {
-        Decode {
-            x: HbmTensor::new(),
-            q_s: HbmTensor::new(),
-            q_f: HbmTensor::new(),
-            attn_max: HbmTensor::new(),
-            attn_sum: HbmTensor::new(),
-            attn_s: HbmTensor::new(),
-            attn_f: HbmTensor::new(),
-        }
+    /// A kernel writes each field wholesale before it is ever read, but the NPU backend still
+    /// needs a real device allocation behind each `&mut` output argument at launch time, so
+    /// every field is placed with a throwaway zero write rather than left as `HbmTensor::new()`
+    /// (unplaced, for a kernel that returns its output instead of writing a parameter).
+    pub async fn begin_decode(&mut self, device: &mut Device) -> Result<Decode, Error> {
+        Ok(Decode {
+            x: HostTensor::<bf16, m![H]>::zero().to_hbm(&mut device.pdma).await?,
+            q_s: HostTensor::<bf16, m![Ns, Gs, Ds]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await?,
+            q_f: HostTensor::<bf16, m![Gf, Df]>::zero().to_hbm(&mut device.pdma).await?,
+            attn_max: HostTensor::<f32, m![Gf]>::zero().to_hbm(&mut device.pdma).await?,
+            attn_sum: HostTensor::<f32, m![Gf]>::zero().to_hbm(&mut device.pdma).await?,
+            attn_s: HostTensor::<bf16, m![Ns, Gs, Ds]>::zero()
+                .to_hbm(&mut device.pdma)
+                .await?,
+            attn_f: HostTensor::<bf16, m![Gf, Df]>::zero().to_hbm(&mut device.pdma).await?,
+        })
     }
 }
 
-async fn set_position_offsets(ctx: &mut Context, ws: &mut Workspace, pos: usize) {
+async fn set_position_offsets(device: &mut Device, ws: &mut Workspace, pos: usize) -> Result<(), Error> {
     let ps = pos % Ts::SIZE;
     let pf = pos % Tf::SIZE;
 
@@ -220,52 +238,61 @@ async fn set_position_offsets(ctx: &mut Context, ws: &mut Workspace, pos: usize)
     let offset_rope_s: HostTensor<i32, m![1]> = HostTensor::from_vec([(pos * Ds::SIZE * 2) as i32]);
     let offset_rope_f: HostTensor<i32, m![1]> = HostTensor::from_vec([(pos * Df::SIZE * 2) as i32]);
 
-    ws.offset_kv_s = offset_kv_s.to_hbm(&mut ctx.pdma).await;
-    ws.offset_kv_f = offset_kv_f.to_hbm(&mut ctx.pdma).await;
+    ws.offset_kv_s = offset_kv_s.to_hbm(&mut device.pdma).await?;
+    ws.offset_kv_f = offset_kv_f.to_hbm(&mut device.pdma).await?;
 
-    ws.offset_rope_s = offset_rope_s.to_hbm(&mut ctx.pdma).await;
-    ws.offset_rope_f = offset_rope_f.to_hbm(&mut ctx.pdma).await;
+    ws.offset_rope_s = offset_rope_s.to_hbm(&mut device.pdma).await?;
+    ws.offset_rope_f = offset_rope_f.to_hbm(&mut device.pdma).await?;
+    Ok(())
 }
 
-async fn zero_offset(ctx: &mut Context) -> HbmTensor<i32, Chip, m![1]> {
+async fn zero_offset(device: &mut Device) -> Result<HbmTensor<i32, Chip, m![1]>, Error> {
     let zero: HostTensor<i32, m![1]> = HostTensor::from_vec([0]);
-    zero.to_hbm(&mut ctx.pdma).await
+    zero.to_hbm(&mut device.pdma).await
 }
 
 async fn zero_hbm_vec<D: MaterializableScalar + num_traits::Zero, E: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     count: usize,
-) -> Vec<HbmTensor<D, Chip, E>> {
+) -> Result<Vec<HbmTensor<D, Chip, E>>, Error> {
     let mut tensors = Vec::with_capacity(count);
     for _ in 0..count {
-        tensors.push(HostTensor::<D, E>::zero().to_hbm(&mut ctx.pdma).await);
+        tensors.push(HostTensor::<D, E>::zero().to_hbm(&mut device.pdma).await?);
     }
-    tensors
+    Ok(tensors)
 }
 
-async fn upload_mask_rows<Elt: M, F>(ctx: &mut Context, width: usize, mut value: F) -> Vec<HbmTensor<f32, Chip, Elt>>
+async fn upload_mask_rows<Elt: M, F>(
+    device: &mut Device,
+    width: usize,
+    mut value: F,
+) -> Result<Vec<HbmTensor<f32, Chip, Elt>>, Error>
 where
     F: FnMut(usize, usize) -> f32,
 {
     let mut rows = Vec::with_capacity(width);
     for r in 0..width {
         let row: Vec<f32> = (0..width).map(|c| value(r, c)).collect();
-        rows.push(HostTensor::<f32, Elt>::from_vec(row).to_hbm(&mut ctx.pdma).await);
+        rows.push(HostTensor::<f32, Elt>::from_vec(row).to_hbm(&mut device.pdma).await?);
     }
-    rows
+    Ok(rows)
 }
 
 async fn upload_rope<D: AxisName>(
-    ctx: &mut Context,
+    device: &mut Device,
     dim: usize,
     theta: f32,
     rotated_dim: usize,
-) -> (HbmTensor<bf16, Chip, m![E, D]>, HbmTensor<bf16, Chip, m![E, D]>) {
+) -> Result<(HbmTensor<bf16, Chip, m![E, D]>, HbmTensor<bf16, Chip, m![E, D]>), Error> {
     let (cos, sin) = rope_data(dim, theta, rotated_dim);
-    (
-        HostTensor::<bf16, m![E, D]>::from_vec(cos).to_hbm(&mut ctx.pdma).await,
-        HostTensor::<bf16, m![E, D]>::from_vec(sin).to_hbm(&mut ctx.pdma).await,
-    )
+    Ok((
+        HostTensor::<bf16, m![E, D]>::from_vec(cos)
+            .to_hbm(&mut device.pdma)
+            .await?,
+        HostTensor::<bf16, m![E, D]>::from_vec(sin)
+            .to_hbm(&mut device.pdma)
+            .await?,
+    ))
 }
 
 fn rope_data(dim: usize, theta: f32, rotated_dim: usize) -> (Vec<bf16>, Vec<bf16>) {
@@ -311,73 +338,80 @@ pub struct Decode {
 impl Decode {
     pub async fn run(
         &mut self,
-        ctx: &mut Context,
+        device: &mut Device,
         ws: &mut Workspace,
         token: usize,
         model: &Model,
         pos: usize,
         compute_logits: bool,
-    ) {
+    ) -> Result<(), Error> {
         let offset: HostTensor<i32, m![1]> = HostTensor::from_vec([(token * H::SIZE * 2) as i32]);
-        let offset: HbmTensor<i32, Chip, m![1]> = offset.to_hbm(&mut ctx.pdma).await;
+        let offset: HbmTensor<i32, Chip, m![1]> = offset.to_hbm(&mut device.pdma).await?;
 
-        launch(ops::embed_token, (ctx, &model.embedding_table, &offset, &mut self.x)).await;
-        self.run_layers(ctx, ws, model, pos, compute_logits).await;
+        launch(ops::embed_token, (device, &model.embedding_table, &offset, &mut self.x)).await?;
+        self.run_layers(device, ws, model, pos, compute_logits).await
     }
 
     pub async fn run_with_embedding(
         &mut self,
-        ctx: &mut Context,
+        device: &mut Device,
         ws: &mut Workspace,
         embedding: HbmTensor<bf16, Chip, m![H]>,
         model: &Model,
         pos: usize,
         compute_logits: bool,
-    ) {
+    ) -> Result<(), Error> {
         self.x = embedding;
-        self.run_layers(ctx, ws, model, pos, compute_logits).await;
+        self.run_layers(device, ws, model, pos, compute_logits).await
     }
 
     async fn run_layers(
         &mut self,
-        ctx: &mut Context,
+        device: &mut Device,
         ws: &mut Workspace,
         model: &Model,
         pos: usize,
         compute_logits: bool,
-    ) {
+    ) -> Result<(), Error> {
         assert!(pos < E::SIZE, "position exceeds runtime context");
-        set_position_offsets(ctx, ws, pos).await;
+        set_position_offsets(device, ws, pos).await?;
         for (layer_index, layer) in model.layers.iter().enumerate() {
             match layer {
-                Layer::Sliding(layer) => self.sliding(ctx, ws, layer_index, layer, pos).await,
-                Layer::Full(layer) => self.full(ctx, ws, layer_index, layer, pos).await,
+                Layer::Sliding(layer) => self.sliding(device, ws, layer_index, layer, pos).await?,
+                Layer::Full(layer) => self.full(device, ws, layer_index, layer, pos).await?,
             }
         }
 
         if compute_logits {
             launch(
                 ops::final_norm_and_logits,
-                (ctx, &self.x, &model.final_norm, &model.embedding_table, &mut ws.logits),
+                (
+                    device,
+                    &self.x,
+                    &model.final_norm,
+                    &model.embedding_table,
+                    &mut ws.logits,
+                ),
             )
-            .await;
+            .await?;
         }
+        Ok(())
     }
 
     async fn sliding(
         &mut self,
-        ctx: &mut Context,
+        device: &mut Device,
         ws: &mut Workspace,
         layer_index: usize,
         layer: &SlidingLayer,
         pos: usize,
-    ) {
+    ) -> Result<(), Error> {
         let mask_row = pos.min(Ts::SIZE - 1);
         let (k, v) = ws.kv_cache[layer_index].as_sliding_mut();
         launch(
             ops::sliding_project_qkv,
             (
-                ctx,
+                device,
                 &self.x,
                 &layer.q_weight,
                 &layer.k_weight,
@@ -397,16 +431,16 @@ impl Decode {
                 &mut self.q_s,
             ),
         )
-        .await;
+        .await?;
         launch(
             ops::sliding_attention,
-            (ctx, &self.q_s, &*k, &*v, &ws.mask_s[mask_row], &mut self.attn_s),
+            (device, &self.q_s, &*k, &*v, &ws.mask_s[mask_row], &mut self.attn_s),
         )
-        .await;
+        .await?;
         launch(
             ops::sliding_attention_output,
             (
-                ctx,
+                device,
                 &self.attn_s,
                 &layer.post_attention_norm,
                 &layer.o_weight,
@@ -414,18 +448,25 @@ impl Decode {
                 &mut self.x,
             ),
         )
-        .await;
+        .await?;
         self.mlp(
-            ctx,
+            device,
             &layer.mlp,
             &layer.pre_feedforward_norm,
             &layer.post_feedforward_norm,
             &layer.layer_scalar,
         )
-        .await;
+        .await
     }
 
-    async fn full(&mut self, ctx: &mut Context, ws: &mut Workspace, layer_index: usize, layer: &FullLayer, pos: usize) {
+    async fn full(
+        &mut self,
+        device: &mut Device,
+        ws: &mut Workspace,
+        layer_index: usize,
+        layer: &FullLayer,
+        pos: usize,
+    ) -> Result<(), Error> {
         let page = pos / Tf::SIZE;
         let row = pos % Tf::SIZE;
         assert!(page < C::SIZE, "position exceeds full-attention cache");
@@ -433,7 +474,7 @@ impl Decode {
         launch(
             ops::full_project_qkv,
             (
-                ctx,
+                device,
                 &self.x,
                 &layer.q_weight,
                 &layer.k_weight,
@@ -451,7 +492,7 @@ impl Decode {
                 &mut self.q_f,
             ),
         )
-        .await;
+        .await?;
 
         for kv_page in 0..=page {
             let mask = if kv_page == page {
@@ -460,7 +501,7 @@ impl Decode {
                 &ws.mask_f_line
             };
             let args = (
-                &mut *ctx,
+                &mut *device,
                 &self.q_f,
                 &k_cache[kv_page],
                 &v_cache[kv_page],
@@ -470,16 +511,16 @@ impl Decode {
                 &mut self.attn_f,
             );
             if kv_page == 0 {
-                launch(ops::full_attention_first_page, args).await;
+                launch(ops::full_attention_first_page, args).await?;
             } else {
-                launch(ops::full_attention_page, args).await;
+                launch(ops::full_attention_page, args).await?;
             }
         }
 
         launch(
             ops::full_attention_output,
             (
-                ctx,
+                device,
                 &self.attn_f,
                 &self.attn_sum,
                 &layer.post_attention_norm,
@@ -488,29 +529,29 @@ impl Decode {
                 &mut self.x,
             ),
         )
-        .await;
+        .await?;
         self.mlp(
-            ctx,
+            device,
             &layer.mlp,
             &layer.pre_feedforward_norm,
             &layer.post_feedforward_norm,
             &layer.layer_scalar,
         )
-        .await;
+        .await
     }
 
     async fn mlp(
         &mut self,
-        ctx: &mut Context,
+        device: &mut Device,
         mlp: &crate::host::load::MlpWeights,
         pre_feedforward_norm: &HbmTensor<bf16, Chip, m![H]>,
         post_feedforward_norm: &HbmTensor<bf16, Chip, m![H]>,
         layer_scalar: &HbmTensor<bf16, Chip, m![1 # 8]>,
-    ) {
+    ) -> Result<(), Error> {
         launch(
             ops::decoder_feedforward,
             (
-                ctx,
+                device,
                 &mut self.x,
                 pre_feedforward_norm,
                 &mlp.up_weight_packed,
@@ -526,6 +567,6 @@ impl Decode {
                 layer_scalar,
             ),
         )
-        .await;
+        .await
     }
 }

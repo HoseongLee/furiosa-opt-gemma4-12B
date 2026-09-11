@@ -18,7 +18,7 @@ if [ ! -x "$binary" ]; then
     binary=./test_runtime.exec
 fi
 
-TUC_PROFILE_LEVEL="${TUC_PROFILE_LEVEL:-info}" "$binary"
+FURIOSA_OPT_PROFILE="${FURIOSA_OPT_PROFILE:-info}" "$binary"
 status=$?
 rm -f ./test_runtime.exec 2>/dev/null || true
 

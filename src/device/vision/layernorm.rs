@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Mv, Rv};
@@ -8,10 +7,11 @@ const MV_F32: f32 = Mv::SIZE as f32;
 const RV_F32: f32 = Rv::SIZE as f32;
 
 fn mean<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Mv]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Mv / 16], m![Mv % 16]>()
         .fetch_cast::<f32>()
@@ -28,10 +28,11 @@ fn mean<Cluster: M, Slice: M>(
 }
 
 fn to_vrf<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]>,
 ) -> VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.sub
+    device
+        .sub
         .begin(x.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
@@ -39,15 +40,15 @@ fn to_vrf<Cluster: M, Slice: M>(
 }
 
 pub(crate) fn normalize<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Mv]>,
     weight: &HbmTensor<bf16, Chip, m![Mv]>,
     bias: &HbmTensor<bf16, Chip, m![Mv]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> {
-    let mean = mean(ctx, x);
-    let mean_vrf = to_vrf(ctx, &mean);
+    let mean = mean(device, x);
+    let mean_vrf = to_vrf(device, &mean);
 
-    let centred: DmTensor<f32, Chip, Cluster, Slice, m![Mv]> = ctx
+    let centred: DmTensor<f32, Chip, Cluster, Slice, m![Mv]> = device
         .main
         .begin(x.view())
         .fetch::<m![Mv / 16], m![Mv % 16]>()
@@ -62,7 +63,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit_trim::<m![Mv % 8]>()
         .commit();
 
-    let var: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let var: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .main
         .begin(centred.view())
         .fetch::<m![Mv / 8], m![Mv % 8]>()
@@ -80,7 +81,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit_trim::<m![1 # 8]>()
         .commit();
 
-    let std_dev: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let std_dev: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .main
         .begin(var.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -93,10 +94,10 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let std_vrf = to_vrf(ctx, &std_dev);
+    let std_vrf = to_vrf(device, &std_dev);
 
-    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> = weight.to_dm(&mut ctx.tdma);
-    let bias_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> = bias.to_dm(&mut ctx.tdma);
+    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> = weight.to_dm(&mut device.tdma);
+    let bias_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> = bias.to_dm(&mut device.tdma);
 
     const TILES: usize = Mv::SIZE / 480;
 
@@ -107,7 +108,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         let weight_tile = weight_dm.view().tile::<m![Mv], 480, m![Mv = 480 # 3840]>(480 * i);
         let bias_tile = bias_dm.view().tile::<m![Mv], 480, m![Mv = 480 # 3840]>(480 * i);
 
-        let weight_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = ctx
+        let weight_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = device
             .sub
             .begin(weight_tile)
             .fetch::<m![1], m![Mv = 480]>()
@@ -115,7 +116,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
             .collect::<m![Mv = 480 / 8], m![Mv = 480 % 8]>()
             .to_vrf();
 
-        let bias_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = ctx
+        let bias_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = device
             .sub
             .begin(bias_tile)
             .fetch::<m![1], m![Mv = 480]>()
@@ -123,7 +124,8 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
             .collect::<m![Mv = 480 / 8], m![Mv = 480 % 8]>()
             .to_vrf();
 
-        ctx.main
+        device
+            .main
             .begin(centred_tile)
             .fetch::<m![1], m![Mv = 480]>()
             .collect::<m![Mv = 480 / 8], m![Mv = 480 % 8]>()
@@ -144,10 +146,11 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
 }
 
 fn mean_patch<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Rv]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Rv / 16], m![Rv % 16]>()
         .fetch_cast::<f32>()
@@ -164,15 +167,15 @@ fn mean_patch<Cluster: M, Slice: M>(
 }
 
 pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Rv]>,
     weight: &HbmTensor<bf16, Chip, m![Rv]>,
     bias: &HbmTensor<bf16, Chip, m![Rv]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Rv]> {
-    let mean = mean_patch(ctx, x);
-    let mean_vrf = to_vrf(ctx, &mean);
+    let mean = mean_patch(device, x);
+    let mean_vrf = to_vrf(device, &mean);
 
-    let centred: DmTensor<f32, Chip, Cluster, Slice, m![Rv]> = ctx
+    let centred: DmTensor<f32, Chip, Cluster, Slice, m![Rv]> = device
         .main
         .begin(x.view())
         .fetch::<m![Rv / 16], m![Rv % 16]>()
@@ -187,7 +190,7 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
         .commit_trim::<m![Rv % 8]>()
         .commit();
 
-    let var: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let var: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .main
         .begin(centred.view())
         .fetch::<m![Rv / 8], m![Rv % 8]>()
@@ -205,7 +208,7 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
         .commit_trim::<m![1 # 8]>()
         .commit();
 
-    let std_dev: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let std_dev: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .main
         .begin(var.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -218,10 +221,10 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let std_vrf = to_vrf(ctx, &std_dev);
+    let std_vrf = to_vrf(device, &std_dev);
 
-    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Rv]> = weight.to_dm(&mut ctx.tdma);
-    let bias_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Rv]> = bias.to_dm(&mut ctx.tdma);
+    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Rv]> = weight.to_dm(&mut device.tdma);
+    let bias_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Rv]> = bias.to_dm(&mut device.tdma);
 
     const TILES: usize = Rv::SIZE / 864;
 
@@ -232,7 +235,7 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
         let weight_tile = weight_dm.view().tile::<m![Rv], 864, m![Rv = 864 # 6912]>(864 * i);
         let bias_tile = bias_dm.view().tile::<m![Rv], 864, m![Rv = 864 # 6912]>(864 * i);
 
-        let weight_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Rv = 864]> = ctx
+        let weight_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Rv = 864]> = device
             .sub
             .begin(weight_tile)
             .fetch::<m![1], m![Rv = 864]>()
@@ -240,7 +243,7 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
             .collect::<m![Rv = 864 / 8], m![Rv = 864 % 8]>()
             .to_vrf();
 
-        let bias_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Rv = 864]> = ctx
+        let bias_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Rv = 864]> = device
             .sub
             .begin(bias_tile)
             .fetch::<m![1], m![Rv = 864]>()
@@ -248,7 +251,8 @@ pub(crate) fn normalize_patch<Cluster: M, Slice: M>(
             .collect::<m![Rv = 864 / 8], m![Rv = 864 % 8]>()
             .to_vrf();
 
-        ctx.main
+        device
+            .main
             .begin(centred_tile)
             .fetch::<m![1], m![Rv = 864]>()
             .collect::<m![Rv = 864 / 8], m![Rv = 864 % 8]>()

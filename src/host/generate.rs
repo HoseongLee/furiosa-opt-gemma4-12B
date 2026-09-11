@@ -1,4 +1,3 @@
-
 use crate::Chip;
 use crate::axes::{E, W};
 use crate::host::audio::AudioFrames;
@@ -127,19 +126,27 @@ fn step_over_marker(
     Ok((!held.is_empty()).then(|| held.to_owned()))
 }
 
-pub async fn read_logits(ctx: &mut Context, logits: &HbmTensor<bf16, Chip, m![W]>) -> Vec<f32> {
-    let logits: HostTensor<bf16, m![W]> = logits.to_host(&mut ctx.pdma).await;
-    logits.into_vec().into_iter().map(bf16::to_f32).collect()
+pub async fn read_logits(
+    device: &mut Device,
+    logits: &HbmTensor<bf16, Chip, m![W]>,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let logits: HostTensor<bf16, m![W]> = logits.to_host(&mut device.pdma).await?;
+    Ok(logits.into_vec().into_iter().map(bf16::to_f32).collect())
 }
 
 async fn sample_next(
-    ctx: &mut Context,
+    device: &mut Device,
     workspace: &Workspace,
     sampling: &SamplingConfig,
     banned: &HashSet<usize>,
     rng: &mut impl rand::Rng,
-) -> usize {
-    sample(&read_logits(ctx, &workspace.logits).await, sampling, banned, rng)
+) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(sample(
+        &read_logits(device, &workspace.logits).await?,
+        sampling,
+        banned,
+        rng,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +175,7 @@ pub struct GenerationOutput {
 }
 
 pub async fn generate(
-    ctx: &mut Context,
+    device: &mut Device,
     model: &Model,
     tokenizer: &Tokenizer,
     workspace: &mut Workspace,
@@ -190,7 +197,7 @@ pub async fn generate(
         .into());
     }
 
-    let mut decode = workspace.begin_decode();
+    let mut decode = workspace.begin_decode(device).await?;
     let last_prompt_pos = req.prompt_ids.len() - 1;
     for (pos, (&token, soft_token)) in req.prompt_ids.iter().zip(req.soft_at.iter()).enumerate() {
         let compute_logits = pos == last_prompt_pos;
@@ -198,27 +205,27 @@ pub async fn generate(
             Some(SoftToken::Image(i)) => {
                 let patches = req.image.as_ref().expect("soft_at only set when an image was loaded");
                 let embedding =
-                    runtime::encode_vision_patch(ctx, model, &patches.pixels[*i], patches.positions[*i]).await;
+                    runtime::encode_vision_patch(device, model, &patches.pixels[*i], patches.positions[*i]).await?;
                 decode
-                    .run_with_embedding(ctx, workspace, embedding, model, pos, compute_logits)
-                    .await;
+                    .run_with_embedding(device, workspace, embedding, model, pos, compute_logits)
+                    .await?;
             }
             Some(SoftToken::Audio(i)) => {
                 let audio = req.audio.as_ref().expect("soft_at only set when audio was loaded");
-                let embedding = runtime::encode_audio_frame(ctx, model, &audio.frames[*i]).await;
+                let embedding = runtime::encode_audio_frame(device, model, &audio.frames[*i]).await?;
                 decode
-                    .run_with_embedding(ctx, workspace, embedding, model, pos, compute_logits)
-                    .await;
+                    .run_with_embedding(device, workspace, embedding, model, pos, compute_logits)
+                    .await?;
             }
             None => {
-                decode.run(ctx, workspace, token, model, pos, compute_logits).await;
+                decode.run(device, workspace, token, model, pos, compute_logits).await?;
             }
         }
     }
 
     let mut rng = rand::rng();
     let banned: HashSet<usize> = SUPPRESSED_TOKENS.into_iter().collect();
-    let mut next = sample_next(ctx, workspace, &req.sampling, &banned, &mut rng).await;
+    let mut next = sample_next(device, workspace, &req.sampling, &banned, &mut rng).await?;
 
     let stop_strings: Vec<&str> = req
         .stop_strings
@@ -299,8 +306,8 @@ pub async fn generate(
             break;
         }
         let pos = req.prompt_ids.len() + generated_count - 1;
-        decode.run(ctx, workspace, next, model, pos, true).await;
-        next = sample_next(ctx, workspace, &req.sampling, &banned, &mut rng).await;
+        decode.run(device, workspace, next, model, pos, true).await?;
+        next = sample_next(device, workspace, &req.sampling, &banned, &mut rng).await?;
     }
     if !stopped_on_stop_string && emitted < text.len() {
         let _ = on_delta(Delta::Content(&text[emitted..]));

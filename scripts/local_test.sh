@@ -21,5 +21,4 @@ if [ ! -f "$FIXTURE" ]; then
 fi
 
 echo "==> running test_kernels"
-cargo furiosa-opt compile
-TUC_PROFILE_LEVEL="${TUC_PROFILE_LEVEL:-info}" cargo furiosa-opt run --release --bin test_kernels
+FURIOSA_OPT_PROFILE="${FURIOSA_OPT_PROFILE:-info}" cargo furiosa-opt run --release --bin test_kernels

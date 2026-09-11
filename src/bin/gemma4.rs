@@ -1,4 +1,3 @@
-
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc;
@@ -55,9 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(generate::DEFAULT_MAX_NEW_TOKENS);
 
-    let mut ctx = Context::acquire();
+    let mut device = Device::new(furiosa_opt_gemma4::ops::embed_token.topology())?;
     let load_start = Instant::now();
-    let model = load::load_model(&mut ctx).await?;
+    let model = load::load_model(&mut device).await?;
     eprintln!("model loaded in {:.2?}", load_start.elapsed());
 
     let image = args
@@ -73,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chat_ids = tokenizer.encode_chat(&messages, false)?;
     let (prompt_ids, soft_at) = generate::splice_multimodal_tokens(chat_ids, image.as_ref(), None)?;
 
-    let mut workspace = Workspace::new(&mut ctx, &model).await;
+    let mut workspace = Workspace::new(&mut device, &model).await?;
 
     println!("{}", args.prompt);
     io::stdout().flush()?;
@@ -99,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let run_start = Instant::now();
     let mut first_token_at = None;
-    let output = generate::generate(&mut ctx, &model, &tokenizer, &mut workspace, req, |delta| {
+    let output = generate::generate(&mut device, &model, &tokenizer, &mut workspace, req, |delta| {
         if first_token_at.is_none() {
             first_token_at = Some(Instant::now());
         }

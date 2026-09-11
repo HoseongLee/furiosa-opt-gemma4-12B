@@ -25,7 +25,6 @@ BINARY="target/release/test_kernels"
 
 if [ "$build" -eq 1 ]; then
     echo "==> building test_kernels (as a --bin, for a populated kernel registry)"
-    cargo furiosa-opt compile
     cargo furiosa-opt build --release --bin test_kernels
 fi
 

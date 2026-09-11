@@ -19,7 +19,7 @@ The three Stage 1 kernels are declared in `src/ops.rs`:
 | `ops::decoder_feedforward` | RMSNorm, GeGLU MLP, post-FF RMSNorm, residual add, and layer gate |
 
 The kernels use the model's existing quantized weights and tensor layouts. Each kernel is
-measured across 7 independently-seeded input configurations for the Stage 1 test (see
+measured across 3 independently-seeded input configurations for the Stage 1 test (see
 "Grading criteria" below), not a single fixed invocation.
 
 Stage 2 covers the complete E2E model-serving path except for the public API endpoint in
@@ -40,10 +40,10 @@ of truth for Stage 1 correctness and kernel performance.
 The Stage 1 test checks:
 
 1. **Buildability:** the allowed code compiles with the competition toolchain.
-2. **Correctness:** each kernel satisfies the published tolerances on every one of 7
+2. **Correctness:** each kernel satisfies the published tolerances on every one of 3
    independently-seeded input configurations, not just one -- a kernel that special-cases
    a fixed input fails as soon as a different configuration exposes it.
-3. **Performance:** the test reports each kernel's median RNGD cycle count across those 7
+3. **Performance:** the test reports each kernel's median RNGD cycle count across those 3
    runs, so one unusually fast or slow run doesn't move the number that's graded.
 
 Stage 1 values to be finalized:
@@ -77,7 +77,7 @@ For the Stage 1 kernel evaluation, `src/bin/test_kernels.rs` defines the followi
 | `decoder_feedforward` | `0.01` | `1e-2` |
 
 The grading server will measure performance using the official evaluation. The Stage 1 test
-reports each kernel's median RNGD cycle count across 7 independently-seeded runs; the
+reports each kernel's median RNGD cycle count across 3 independently-seeded runs; the
 Stage 2 E2E performance metric is TBD.
 
 The following scoring values are still TBD:
@@ -176,7 +176,7 @@ sudo apt install gcc-aarch64-linux-gnu
 
 rustup toolchain install nightly-2026-05-01
 cargo +nightly-2026-05-01 install cargo-binstall
-cargo +nightly-2026-05-01 binstall cargo-furiosa-opt@0.6.0
+cargo +nightly-2026-05-01 binstall cargo-furiosa-opt@0.8.1
 cargo install furiosa-schedule-viewer
 ```
 

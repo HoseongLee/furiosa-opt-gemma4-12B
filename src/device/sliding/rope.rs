@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::Chip;
@@ -8,7 +7,7 @@ use crate::device::layout::{Cluster, Slice};
 type KvHeadsAcrossSlices = m![1 # 32, Ns];
 
 pub(crate) fn apply_rope(
-    ctx: &mut Context,
+    device: &mut Device,
     q: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Gs, Ds]>,
     k: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
     rope_offset: &HbmTensor<i32, Chip, m![1]>,
@@ -21,10 +20,10 @@ pub(crate) fn apply_rope(
     let cos: DmTensor<bf16, Chip, Cluster, Slice, m![Ds]> = cos.dma_gather_scaled(rope_offset);
     let sin: DmTensor<bf16, Chip, Cluster, Slice, m![Ds]> = sin.dma_gather_scaled(rope_offset);
 
-    let cos: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = cos.to_dm(&mut ctx.tdma);
-    let sin: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = sin.to_dm(&mut ctx.tdma);
+    let cos: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = cos.to_dm(&mut device.tdma);
+    let sin: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = sin.to_dm(&mut device.tdma);
 
-    let cos_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let cos_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .sub
         .begin(cos.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
@@ -32,7 +31,7 @@ pub(crate) fn apply_rope(
         .collect::<m![Ds / 8], m![Ds % 8]>()
         .to_vrf();
 
-    let sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .sub
         .begin(sin.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
@@ -40,7 +39,7 @@ pub(crate) fn apply_rope(
         .collect::<m![Ds / 8], m![Ds % 8]>()
         .to_vrf();
 
-    let q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![1 # 8, Gs, Ds]> = ctx
+    let q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![1 # 8, Gs, Ds]> = device
         .main
         .begin(q.view())
         .fetch::<m![Ns], m![Gs, Ds]>()
@@ -53,7 +52,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 16]>()
         .commit();
 
-    let k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![1 # 8, Ds]> = ctx
+    let k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![1 # 8, Ds]> = device
         .main
         .begin(k.view())
         .fetch::<m![Ns], m![Ds]>()
@@ -66,7 +65,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 16]>()
         .commit();
 
-    let q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = ctx
+    let q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = device
         .main
         .begin(q.view())
         .fetch::<m![1], m![Gs, Ds]>()
@@ -74,7 +73,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 16]>()
         .commit();
 
-    let k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .main
         .begin(k.view())
         .fetch::<m![1], m![Ds]>()
@@ -87,7 +86,8 @@ pub(crate) fn apply_rope(
 
     let mut rotate_half_q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = DmTensor::new();
 
-    ctx.main
+    device
+        .main
         .begin(first_half_q)
         .fetch::<m![Gs], m![Ds = 128]>()
         .collect::<m![Gs, Ds = 128 / 16], m![Ds = 128 % 16]>()
@@ -98,7 +98,8 @@ pub(crate) fn apply_rope(
                 .tile::<m![Ds], 128, m![Gs, Ds = 128 #{!} 256]>(128),
         );
 
-    ctx.main
+    device
+        .main
         .begin(second_half_q)
         .fetch::<m![Gs], m![Ds = 128]>()
         .collect::<m![Gs, Ds = 128 / 16], m![Ds = 128 % 16]>()
@@ -114,21 +115,23 @@ pub(crate) fn apply_rope(
 
     let mut rotate_half_k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = DmTensor::new();
 
-    ctx.main
+    device
+        .main
         .begin(first_half_k)
         .fetch::<m![1], m![Ds = 128]>()
         .collect::<m![Ds = 128 / 16], m![Ds = 128 % 16]>()
         .commit_trim::<m![Ds = 128 % 16]>()
         .commit_view(rotate_half_k.view_mut().tile::<m![Ds], 128, m![Ds = 128 #{!} 256]>(128));
 
-    ctx.main
+    device
+        .main
         .begin(second_half_k)
         .fetch::<m![1], m![Ds = 128]>()
         .collect::<m![Ds = 128 / 16], m![Ds = 128 % 16]>()
         .commit_trim::<m![Ds = 128 % 16]>()
         .commit_view(rotate_half_k.view_mut().tile::<m![Ds], 128, m![Ds = 128 #{!} 256]>(0));
 
-    let q_cos: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = ctx
+    let q_cos: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = device
         .main
         .begin(q.view())
         .fetch::<m![Gs, Ds / 16], m![Ds % 16]>()
@@ -143,7 +146,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let q_sin: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = ctx
+    let q_sin: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = device
         .main
         .begin(rotate_half_q.view())
         .fetch::<m![Gs, Ds / 16], m![Ds % 16]>()
@@ -158,14 +161,14 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let q_sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = ctx
+    let q_sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = device
         .sub
         .begin(q_sin.view())
         .fetch::<m![Gs, Ds / 8], m![Ds % 8]>()
         .collect::<m![Gs, Ds / 8], m![Ds % 8]>()
         .to_vrf();
 
-    let result_q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = ctx
+    let result_q: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Gs, Ds]> = device
         .main
         .begin(q_cos.view())
         .fetch::<m![Gs, Ds / 8], m![Ds % 8]>()
@@ -178,7 +181,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let k_cos: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let k_cos: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .main
         .begin(k.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
@@ -193,7 +196,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let k_sin: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let k_sin: DmTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .main
         .begin(rotate_half_k.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
@@ -208,14 +211,14 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let k_sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let k_sin_vrf: VrfTensor<f32, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .sub
         .begin(k_sin.view())
         .fetch::<m![Ds / 8], m![Ds % 8]>()
         .collect::<m![Ds / 8], m![Ds % 8]>()
         .to_vrf();
 
-    let result_k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = ctx
+    let result_k: DmTensor<bf16, Chip, Cluster, KvHeadsAcrossSlices, m![Ds]> = device
         .main
         .begin(k_cos.view())
         .fetch::<m![Ds / 8], m![Ds % 8]>()
@@ -228,7 +231,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 8]>()
         .commit();
 
-    let result_q: DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Gs, Ds]> = ctx
+    let result_q: DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Gs, Ds]> = device
         .main
         .begin(result_q.view())
         .fetch::<m![1], m![Gs, Ds]>()
@@ -237,7 +240,7 @@ pub(crate) fn apply_rope(
         .commit_trim::<m![Ds % 16]>()
         .commit();
 
-    let result_k: DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> = ctx
+    let result_k: DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> = device
         .main
         .begin(result_k.view())
         .fetch::<m![1], m![Ds]>()

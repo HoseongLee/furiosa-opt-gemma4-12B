@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -82,14 +81,16 @@ fn run(tokenizer: Tokenizer, jobs: mpsc::Receiver<Job>, ready: mpsc::Sender<Resu
     };
 
     let setup = rt.block_on(async {
-        let mut ctx = Context::acquire();
+        let mut device = Device::new(crate::ops::embed_token.topology()).map_err(|err| err.to_string())?;
         let load_start = Instant::now();
-        let model = load::load_model(&mut ctx).await.map_err(|err| err.to_string())?;
+        let model = load::load_model(&mut device).await.map_err(|err| err.to_string())?;
         eprintln!("model loaded in {:.2?}", load_start.elapsed());
-        let workspace = Workspace::new(&mut ctx, &model).await;
-        Ok::<_, String>((ctx, model, workspace))
+        let workspace = Workspace::new(&mut device, &model)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok::<_, String>((device, model, workspace))
     });
-    let (mut ctx, model, mut workspace) = match setup {
+    let (mut device, model, mut workspace) = match setup {
         Ok(value) => value,
         Err(message) => {
             let _ = ready.send(Err(message));
@@ -107,7 +108,7 @@ fn run(tokenizer: Tokenizer, jobs: mpsc::Receiver<Job>, ready: mpsc::Sender<Resu
         let delta_events = events.clone();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(generate::generate(
-                &mut ctx,
+                &mut device,
                 &model,
                 &tokenizer,
                 &mut workspace,

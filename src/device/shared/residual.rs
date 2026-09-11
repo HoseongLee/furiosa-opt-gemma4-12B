@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::Chip;
@@ -6,7 +5,7 @@ use crate::axes::{H, Mv};
 use crate::device::layout::{Cluster, Slice};
 
 pub(crate) fn add(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
     residual: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
@@ -18,7 +17,7 @@ pub(crate) fn add(
         let x_tile = x.view().tile::<m![H], 480, m![H = 480 # 3840]>(480 * i);
         let residual_tile = residual.view().tile::<m![H], 480, m![H = 480 # 3840]>(480 * i);
 
-        let residual_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![H = 480]> = ctx
+        let residual_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![H = 480]> = device
             .sub
             .begin(residual_tile)
             .fetch::<m![1], m![H = 480]>()
@@ -26,7 +25,8 @@ pub(crate) fn add(
             .collect::<m![H = 480 / 8], m![H = 480 % 8]>()
             .to_vrf();
 
-        ctx.main
+        device
+            .main
             .begin(x_tile)
             .fetch::<m![1], m![H = 480]>()
             .fetch_cast::<f32>()
@@ -44,12 +44,12 @@ pub(crate) fn add(
 }
 
 pub(crate) fn scale_by_layer_gate(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
     scalar: &HbmTensor<bf16, Chip, m![1 # 8]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
-    let scalar: DmTensor<bf16, Chip, Cluster, Slice, m![1 # 8]> = scalar.to_dm(&mut ctx.tdma);
-    let scalar: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let scalar: DmTensor<bf16, Chip, Cluster, Slice, m![1 # 8]> = scalar.to_dm(&mut device.tdma);
+    let scalar: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .sub
         .begin(scalar.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -57,7 +57,8 @@ pub(crate) fn scale_by_layer_gate(
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(input.view())
         .fetch::<m![H / 16], m![H % 16]>()
         .fetch_cast::<f32>()
@@ -74,7 +75,7 @@ pub(crate) fn scale_by_layer_gate(
 }
 
 pub(crate) fn add_vision<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Mv]>,
     residual: &DmTensor<bf16, Chip, Cluster, Slice, m![Mv]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> {
@@ -86,7 +87,7 @@ pub(crate) fn add_vision<Cluster: M, Slice: M>(
         let x_tile = x.view().tile::<m![Mv], 480, m![Mv = 480 # 3840]>(480 * i);
         let residual_tile = residual.view().tile::<m![Mv], 480, m![Mv = 480 # 3840]>(480 * i);
 
-        let residual_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = ctx
+        let residual_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Mv = 480]> = device
             .sub
             .begin(residual_tile)
             .fetch::<m![1], m![Mv = 480]>()
@@ -94,7 +95,8 @@ pub(crate) fn add_vision<Cluster: M, Slice: M>(
             .collect::<m![Mv = 480 / 8], m![Mv = 480 % 8]>()
             .to_vrf();
 
-        ctx.main
+        device
+            .main
             .begin(x_tile)
             .fetch::<m![1], m![Mv = 480]>()
             .fetch_cast::<f32>()

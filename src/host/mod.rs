@@ -1,4 +1,3 @@
-
 pub mod audio;
 pub mod generate;
 pub mod image;

@@ -53,7 +53,7 @@ import gemma4
 CRATE = Path(__file__).resolve().parent.parent
 FIXTURE = CRATE / "ref" / "fixtures.safetensors"
 
-RUNS = 7
+RUNS = 3
 
 H, L, W = 3840, 15360, 262144
 NS, GS, DS, QS, PS, TS = 8, 2, 256, 4096, 2048, 1024

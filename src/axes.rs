@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 axes![

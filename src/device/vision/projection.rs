@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Dummy256, H, Mv, Ov, Rv};
@@ -10,10 +9,10 @@ const OV_F32: f32 = Ov::SIZE as f32;
 type EmbeddingRows = m![Mv / 120, 1 # 8];
 
 fn broadcast_patch(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Rv]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![Rv]> {
-    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Rv]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Rv]> = device
         .main
         .begin(x.view())
         .fetch::<m![1], m![Rv]>()
@@ -26,14 +25,14 @@ fn broadcast_patch(
 }
 
 fn patch_partial(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Replicated, m![Rv]>,
     weight: &HbmTensor<bf16, Chip, m![Mv, Rv]>,
     offset: usize,
 ) -> DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> {
     let x: DmTensorView<'_, bf16, Chip, Cluster, EmbeddingRows, m![Rv]> = unsafe { x.view().reshape() };
     let x_half = x.tile::<m![Rv], 768, m![Rv = 768 # 6912]>(offset);
-    let x_trf: TrfTensor<bf16, Chip, Cluster, EmbeddingRows, m![1], m![Rv = 768]> = ctx
+    let x_trf: TrfTensor<bf16, Chip, Cluster, EmbeddingRows, m![1], m![Rv = 768]> = device
         .sub
         .begin(x_half)
         .fetch::<m![1], m![Rv = 768]>()
@@ -42,9 +41,10 @@ fn patch_partial(
 
     let weight_half = weight.view().tile::<m![Rv], 768, m![Mv, Rv = 768 # 6912]>(offset);
     let weight_dm: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120, Rv = 768]> =
-        weight_half.to_dm(&mut ctx.tdma);
+        weight_half.to_dm(&mut device.tdma);
 
-    ctx.main
+    device
+        .main
         .begin(weight_dm.view())
         .fetch::<m![Mv % 120, Rv = 768 / 16], m![Rv = 768 % 16]>()
         .collect::<m![Mv % 120, Rv = 768 / 16], m![Rv = 768 % 16]>()
@@ -59,11 +59,11 @@ fn patch_partial(
 }
 
 fn add_partials_mv(
-    ctx: &mut Context,
+    device: &mut Device,
     a: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]>,
     b: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]>,
 ) -> DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> {
-    let a_vrf: VrfTensor<f32, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = ctx
+    let a_vrf: VrfTensor<f32, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = device
         .sub
         .begin(a.view())
         .fetch::<m![1], m![Mv % 120]>()
@@ -71,7 +71,8 @@ fn add_partials_mv(
         .collect::<m![Mv / 8 % 15], m![Mv % 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(b.view())
         .fetch::<m![1], m![Mv % 120]>()
         .fetch_cast::<f32>()
@@ -86,37 +87,37 @@ fn add_partials_mv(
 }
 
 pub(crate) fn patch_projection(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Rv]>,
     weight: &HbmTensor<bf16, Chip, m![Mv, Rv]>,
     bias: &HbmTensor<bf16, Chip, m![Mv]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Mv]> {
-    let x = broadcast_patch(ctx, x);
+    let x = broadcast_patch(device, x);
 
     const CHUNK: usize = 768;
 
-    let chunk0 = patch_partial(ctx, &x, weight, 0);
-    let chunk1 = patch_partial(ctx, &x, weight, CHUNK);
-    let chunk2 = patch_partial(ctx, &x, weight, 2 * CHUNK);
-    let chunk3 = patch_partial(ctx, &x, weight, 3 * CHUNK);
-    let chunk4 = patch_partial(ctx, &x, weight, 4 * CHUNK);
-    let chunk5 = patch_partial(ctx, &x, weight, 5 * CHUNK);
-    let chunk6 = patch_partial(ctx, &x, weight, 6 * CHUNK);
-    let chunk7 = patch_partial(ctx, &x, weight, 7 * CHUNK);
-    let chunk8 = patch_partial(ctx, &x, weight, 8 * CHUNK);
+    let chunk0 = patch_partial(device, &x, weight, 0);
+    let chunk1 = patch_partial(device, &x, weight, CHUNK);
+    let chunk2 = patch_partial(device, &x, weight, 2 * CHUNK);
+    let chunk3 = patch_partial(device, &x, weight, 3 * CHUNK);
+    let chunk4 = patch_partial(device, &x, weight, 4 * CHUNK);
+    let chunk5 = patch_partial(device, &x, weight, 5 * CHUNK);
+    let chunk6 = patch_partial(device, &x, weight, 6 * CHUNK);
+    let chunk7 = patch_partial(device, &x, weight, 7 * CHUNK);
+    let chunk8 = patch_partial(device, &x, weight, 8 * CHUNK);
 
-    let sum01 = add_partials_mv(ctx, chunk0, chunk1);
-    let sum23 = add_partials_mv(ctx, chunk2, chunk3);
-    let sum45 = add_partials_mv(ctx, chunk4, chunk5);
-    let sum67 = add_partials_mv(ctx, chunk6, chunk7);
+    let sum01 = add_partials_mv(device, chunk0, chunk1);
+    let sum23 = add_partials_mv(device, chunk2, chunk3);
+    let sum45 = add_partials_mv(device, chunk4, chunk5);
+    let sum67 = add_partials_mv(device, chunk6, chunk7);
 
-    let sum0123 = add_partials_mv(ctx, sum01, sum23);
-    let sum4567 = add_partials_mv(ctx, sum45, sum67);
-    let sum0_to_7 = add_partials_mv(ctx, sum0123, sum4567);
-    let sum = add_partials_mv(ctx, sum0_to_7, chunk8);
+    let sum0123 = add_partials_mv(device, sum01, sum23);
+    let sum4567 = add_partials_mv(device, sum45, sum67);
+    let sum0_to_7 = add_partials_mv(device, sum0123, sum4567);
+    let sum = add_partials_mv(device, sum0_to_7, chunk8);
 
-    let bias: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = bias.to_dm(&mut ctx.tdma);
-    let bias_vrf: VrfTensor<f32, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = ctx
+    let bias: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = bias.to_dm(&mut device.tdma);
+    let bias_vrf: VrfTensor<f32, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = device
         .sub
         .begin(bias.view())
         .fetch::<m![1], m![Mv % 120]>()
@@ -124,7 +125,7 @@ pub(crate) fn patch_projection(
         .collect::<m![Mv / 8 % 15], m![Mv % 8]>()
         .to_vrf();
 
-    let output: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = ctx
+    let output: DmTensor<bf16, Chip, Cluster, EmbeddingRows, m![Mv % 120]> = device
         .main
         .begin(sum.view())
         .fetch::<m![1], m![Mv % 120]>()
@@ -138,7 +139,8 @@ pub(crate) fn patch_projection(
         .commit_trim::<m![Mv % 8]>()
         .commit();
 
-    ctx.main
+    device
+        .main
         .begin(output.view())
         .fetch::<m![Mv / 8 % 15], m![Mv % 8 # 16]>()
         .switch::<Slice, m![Mv / 8 % 15, Mv / 120]>(SwitchConfig::Broadcast1 { slice1: 32, slice0: 8 })
@@ -148,10 +150,11 @@ pub(crate) fn patch_projection(
 }
 
 fn mean_square_ov(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![Ov]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(input.view())
         .fetch::<m![Ov / 16], m![Ov % 16]>()
         .fetch_cast::<f32>()
@@ -171,10 +174,11 @@ fn mean_square_ov(
 }
 
 fn rms_ov(
-    ctx: &mut Context,
+    device: &mut Device,
     mean_square: &DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
@@ -189,19 +193,20 @@ fn rms_ov(
 }
 
 fn rmsnorm_without_weight(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ov]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ov]> {
-    let mean_square = mean_square_ov(ctx, x);
-    let rms = rms_ov(ctx, &mean_square);
-    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let mean_square = mean_square_ov(device, x);
+    let rms = rms_ov(device, &mean_square);
+    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .sub
         .begin(rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Ov / 16], m![Ov % 16]>()
         .fetch_cast::<f32>()
@@ -218,10 +223,10 @@ fn rmsnorm_without_weight(
 }
 
 fn broadcast_output(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ov]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![Ov]> {
-    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Ov]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Ov]> = device
         .main
         .begin(x.view())
         .fetch::<m![1], m![Ov]>()
@@ -236,14 +241,14 @@ fn broadcast_output(
 type HiddenRows = m![H / 120, 1 # 8];
 
 fn project_partial(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Replicated, m![Ov]>,
     weight: &HbmTensor<bf16, Chip, m![H, Ov]>,
     offset: usize,
 ) -> DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120]> {
     let x: DmTensorView<'_, bf16, Chip, Cluster, HiddenRows, m![Ov]> = unsafe { x.view().reshape() };
     let x_half = x.tile::<m![Ov], 768, m![Ov = 768 # 3840]>(offset);
-    let x_trf: TrfTensor<bf16, Chip, Cluster, HiddenRows, m![1], m![Ov = 768]> = ctx
+    let x_trf: TrfTensor<bf16, Chip, Cluster, HiddenRows, m![1], m![Ov = 768]> = device
         .sub
         .begin(x_half)
         .fetch::<m![1], m![Ov = 768]>()
@@ -251,9 +256,11 @@ fn project_partial(
         .to_trf();
 
     let weight_half = weight.view().tile::<m![Ov], 768, m![H, Ov = 768 # 3840]>(offset);
-    let weight_dm: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120, Ov = 768]> = weight_half.to_dm(&mut ctx.tdma);
+    let weight_dm: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120, Ov = 768]> =
+        weight_half.to_dm(&mut device.tdma);
 
-    ctx.main
+    device
+        .main
         .begin(weight_dm.view())
         .fetch::<m![H % 120, Ov = 768 / 16], m![Ov = 768 % 16]>()
         .collect::<m![H % 120, Ov = 768 / 16], m![Ov = 768 % 16]>()
@@ -268,11 +275,11 @@ fn project_partial(
 }
 
 fn add_partials_h(
-    ctx: &mut Context,
+    device: &mut Device,
     a: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120]>,
     b: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120]>,
 ) -> DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120]> {
-    let a_vrf: VrfTensor<f32, Chip, Cluster, HiddenRows, m![H % 120]> = ctx
+    let a_vrf: VrfTensor<f32, Chip, Cluster, HiddenRows, m![H % 120]> = device
         .sub
         .begin(a.view())
         .fetch::<m![1], m![H % 120]>()
@@ -280,7 +287,8 @@ fn add_partials_h(
         .collect::<m![H / 8 % 15], m![H % 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(b.view())
         .fetch::<m![1], m![H % 120]>()
         .fetch_cast::<f32>()
@@ -295,27 +303,28 @@ fn add_partials_h(
 }
 
 pub(crate) fn project_to_text_hidden(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ov]>,
     weight: &HbmTensor<bf16, Chip, m![H, Ov]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
-    let x = rmsnorm_without_weight(ctx, x);
-    let x = broadcast_output(ctx, &x);
+    let x = rmsnorm_without_weight(device, x);
+    let x = broadcast_output(device, &x);
 
     const CHUNK: usize = 768;
 
-    let chunk0 = project_partial(ctx, &x, weight, 0);
-    let chunk1 = project_partial(ctx, &x, weight, CHUNK);
-    let chunk2 = project_partial(ctx, &x, weight, 2 * CHUNK);
-    let chunk3 = project_partial(ctx, &x, weight, 3 * CHUNK);
-    let chunk4 = project_partial(ctx, &x, weight, 4 * CHUNK);
+    let chunk0 = project_partial(device, &x, weight, 0);
+    let chunk1 = project_partial(device, &x, weight, CHUNK);
+    let chunk2 = project_partial(device, &x, weight, 2 * CHUNK);
+    let chunk3 = project_partial(device, &x, weight, 3 * CHUNK);
+    let chunk4 = project_partial(device, &x, weight, 4 * CHUNK);
 
-    let sum01 = add_partials_h(ctx, chunk0, chunk1);
-    let sum23 = add_partials_h(ctx, chunk2, chunk3);
-    let sum0123 = add_partials_h(ctx, sum01, sum23);
-    let sum = add_partials_h(ctx, sum0123, chunk4);
+    let sum01 = add_partials_h(device, chunk0, chunk1);
+    let sum23 = add_partials_h(device, chunk2, chunk3);
+    let sum0123 = add_partials_h(device, sum01, sum23);
+    let sum = add_partials_h(device, sum0123, chunk4);
 
-    ctx.main
+    device
+        .main
         .begin(sum.view())
         .fetch::<m![H / 8 % 15], m![H % 8 # 16]>()
         .switch::<Slice, m![H / 8 % 15, H / 120]>(SwitchConfig::Broadcast1 { slice1: 32, slice0: 8 })

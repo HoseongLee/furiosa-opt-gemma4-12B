@@ -36,7 +36,7 @@ launching. A plain `cargo run` builds for the CPU and will not work.
 
 Requests are served strictly one at a time. One `Workspace` is one conversation's
 entire KV cache, so there is no batching and no interleaving — a request under load
-waits its turn in the queue. This is a deliberate consequence of the device context
+waits its turn in the queue. This is a deliberate consequence of the device
 being non-`Send`: a single thread owns the device, the model and the workspace for the
 process lifetime. See `api/worker.rs` before changing how the server is threaded.
 

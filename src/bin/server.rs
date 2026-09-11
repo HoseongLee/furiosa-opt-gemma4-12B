@@ -1,4 +1,3 @@
-
 use std::net::SocketAddr;
 
 use furiosa_opt_gemma4::api::server::{self, AppState};

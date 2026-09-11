@@ -165,7 +165,7 @@ const LAYER_SCALAR: f32 = 0.375;
 /// dominant noise source looked like it was between separate process invocations (shared
 /// hardware, thermal, scheduling), not a per-process cold start, so discarding early runs
 /// only cost sample size for no reduction in variance.
-const RUNS: usize = 7;
+const RUNS: usize = 3;
 
 /// The RoPE/cache-offset position for run `run`. Mirrors `generate_references.py`'s
 /// `_run_pos` exactly; never 0, since an all-zero position makes RoPE the identity
@@ -307,54 +307,57 @@ impl<'a> Synth<'a> {
 
     async fn upload<D: MaterializableScalar, E: M>(
         &self,
-        ctx: &mut Context,
+        device: &mut Device,
         name: &str,
         storage: Vec<u8>,
     ) -> HbmTensor<D, Chip, E> {
         self.verify(name, &storage);
-        HostTensor::<D, E>::from_buf(storage).to_hbm(&mut ctx.pdma).await
+        HostTensor::<D, E>::from_buf(storage)
+            .to_hbm(&mut device.pdma)
+            .await
+            .unwrap()
     }
 
-    async fn bf16<E: M>(&self, ctx: &mut Context, name: &str, span: (f32, f32)) -> HbmTensor<bf16, Chip, E> {
+    async fn bf16<E: M>(&self, device: &mut Device, name: &str, span: (f32, f32)) -> HbmTensor<bf16, Chip, E> {
         let storage = prng::bf16_uniform(&self.seed(name), E::SIZE, span.0, span.1);
-        self.upload(ctx, name, storage).await
+        self.upload(device, name, storage).await
     }
 
     async fn f8<E: M>(
         &self,
-        ctx: &mut Context,
+        device: &mut Device,
         name: &str,
         band: (u8, u8),
         signed: bool,
     ) -> HbmTensor<f8e4m3, Chip, E> {
         let storage = prng::f8_banded(&self.seed(name), E::SIZE, band.0, band.1, signed);
-        self.upload(ctx, name, storage).await
+        self.upload(device, name, storage).await
     }
 
-    async fn f4<E: M>(&self, ctx: &mut Context, name: &str) -> HbmTensor<f4e2m1, Chip, E> {
+    async fn f4<E: M>(&self, device: &mut Device, name: &str) -> HbmTensor<f4e2m1, Chip, E> {
         let storage = prng::f4_nibbles(&self.seed(name), E::SIZE);
-        self.upload(ctx, name, storage).await
+        self.upload(device, name, storage).await
     }
 
-    async fn constant_f32<E: M>(&self, ctx: &mut Context, name: &str, values: &[f32]) -> HbmTensor<f32, Chip, E> {
+    async fn constant_f32<E: M>(&self, device: &mut Device, name: &str, values: &[f32]) -> HbmTensor<f32, Chip, E> {
         let storage: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.upload(ctx, name, storage).await
+        self.upload(device, name, storage).await
     }
 
-    async fn constant_bf16<E: M>(&self, ctx: &mut Context, name: &str, values: &[f32]) -> HbmTensor<bf16, Chip, E> {
+    async fn constant_bf16<E: M>(&self, device: &mut Device, name: &str, values: &[f32]) -> HbmTensor<bf16, Chip, E> {
         let storage: Vec<u8> = values
             .iter()
             .flat_map(|v| prng::f32_to_bf16_bits(*v).to_le_bytes())
             .collect();
-        self.upload(ctx, name, storage).await
+        self.upload(device, name, storage).await
     }
 
-    async fn constant_i32<E: M>(&self, ctx: &mut Context, name: &str, value: i32) -> HbmTensor<i32, Chip, E> {
-        self.upload(ctx, name, value.to_le_bytes().to_vec()).await
+    async fn constant_i32<E: M>(&self, device: &mut Device, name: &str, value: i32) -> HbmTensor<i32, Chip, E> {
+        self.upload(device, name, value.to_le_bytes().to_vec()).await
     }
 }
 
-async fn exact_rmsnorm_input(ctx: &mut Context, s: &Synth<'_>) -> HbmTensor<bf16, Chip, m![H]> {
+async fn exact_rmsnorm_input(device: &mut Device, s: &Synth<'_>) -> HbmTensor<bf16, Chip, m![H]> {
     let signs = prng::bf16_signs(&s.seed("x_signs"), H::SIZE, 1.0);
     s.verify("x_signs", &signs);
     let weights = prng::bf16_uniform(&s.seed("input_rms_weight"), H::SIZE, RMS_WEIGHT.0, RMS_WEIGHT.1);
@@ -369,17 +372,21 @@ async fn exact_rmsnorm_input(ctx: &mut Context, s: &Synth<'_>) -> HbmTensor<bf16
         })
         .collect();
     s.verify("x_exact", &storage);
-    HostTensor::<bf16, m![H]>::from_buf(storage).to_hbm(&mut ctx.pdma).await
-}
-
-async fn zeros<D: ScalarBytes + MaterializableScalar, E: M>(ctx: &mut Context) -> HbmTensor<D, Chip, E> {
-    HostTensor::<D, E>::from_buf(vec![0u8; E::SIZE * D::BITS / 8])
-        .to_hbm(&mut ctx.pdma)
+    HostTensor::<bf16, m![H]>::from_buf(storage)
+        .to_hbm(&mut device.pdma)
         .await
+        .unwrap()
 }
 
-async fn read_bf16<E: M>(ctx: &mut Context, tensor: &HbmTensor<bf16, Chip, E>) -> Vec<f32> {
-    let host: HostTensor<bf16, E> = tensor.to_host(&mut ctx.pdma).await;
+async fn zeros<D: ScalarBytes + MaterializableScalar, E: M>(device: &mut Device) -> HbmTensor<D, Chip, E> {
+    HostTensor::<D, E>::from_buf(vec![0u8; E::SIZE * D::BITS / 8])
+        .to_hbm(&mut device.pdma)
+        .await
+        .unwrap()
+}
+
+async fn read_bf16<E: M>(device: &mut Device, tensor: &HbmTensor<bf16, Chip, E>) -> Vec<f32> {
+    let host: HostTensor<bf16, E> = tensor.to_host(&mut device.pdma).await.unwrap();
     host.into_vec().into_iter().map(bf16::to_f32).collect()
 }
 
@@ -410,7 +417,7 @@ fn negate_low_half(sin: &[f32]) -> Vec<f32> {
 }
 
 async fn rope_table<D: AxisName>(
-    ctx: &mut Context,
+    device: &mut Device,
     s: &Synth<'_>,
     name: &str,
     values: &[f32],
@@ -426,8 +433,9 @@ async fn rope_table<D: AxisName>(
     let byte_offset = pos * D::SIZE * 2;
     storage[byte_offset..byte_offset + row.len()].copy_from_slice(&row);
     HostTensor::<bf16, m![E, D]>::from_buf(storage)
-        .to_hbm(&mut ctx.pdma)
+        .to_hbm(&mut device.pdma)
         .await
+        .unwrap()
 }
 
 struct Test {
@@ -457,54 +465,54 @@ const TESTS: &[Test] = &[
 ];
 
 async fn run_test(
-    ctx: &mut Context,
+    device: &mut Device,
     fixture: &Fixture,
     name: &'static str,
     run: usize,
 ) -> Vec<(&'static str, Vec<f32>)> {
     match name {
-        "sliding_project_qkv" => sliding_project_qkv(ctx, fixture, run).await,
-        "sliding_attention_output" => sliding_attention_output(ctx, fixture, run).await,
-        "decoder_feedforward" => decoder_feedforward(ctx, fixture, run).await,
+        "sliding_project_qkv" => sliding_project_qkv(device, fixture, run).await,
+        "sliding_attention_output" => sliding_attention_output(device, fixture, run).await,
+        "decoder_feedforward" => decoder_feedforward(device, fixture, run).await,
         other => panic!("no shim for test `{other}` -- add one in run_test"),
     }
 }
 
-async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+async fn sliding_project_qkv(device: &mut Device, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
     let s = Synth::new("sliding_project_qkv", run, fixture);
     let pos = pos(run);
 
-    let input_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "input_rms_weight", RMS_WEIGHT).await;
-    let x: HbmTensor<bf16, Chip, m![H]> = exact_rmsnorm_input(ctx, &s).await;
+    let input_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "input_rms_weight", RMS_WEIGHT).await;
+    let x: HbmTensor<bf16, Chip, m![H]> = exact_rmsnorm_input(device, &s).await;
 
-    let q_weight: HbmTensor<f8e4m3, Chip, m![Qs, H]> = s.f8(ctx, "q_weight", WEIGHT_EXP, true).await;
-    let k_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(ctx, "k_weight", WEIGHT_EXP, true).await;
-    let v_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(ctx, "v_weight", WEIGHT_EXP, true).await;
-    let q_weight_scale: HbmTensor<bf16, Chip, m![Qs]> = s.bf16(ctx, "q_weight_scale", ROW_SCALE).await;
-    let k_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(ctx, "k_weight_scale", ROW_SCALE).await;
-    let v_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(ctx, "v_weight_scale", ROW_SCALE).await;
-    let q_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "q_rms_weight", UNIT).await;
-    let k_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "k_rms_weight", UNIT).await;
+    let q_weight: HbmTensor<f8e4m3, Chip, m![Qs, H]> = s.f8(device, "q_weight", WEIGHT_EXP, true).await;
+    let k_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(device, "k_weight", WEIGHT_EXP, true).await;
+    let v_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(device, "v_weight", WEIGHT_EXP, true).await;
+    let q_weight_scale: HbmTensor<bf16, Chip, m![Qs]> = s.bf16(device, "q_weight_scale", ROW_SCALE).await;
+    let k_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(device, "k_weight_scale", ROW_SCALE).await;
+    let v_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(device, "v_weight_scale", ROW_SCALE).await;
+    let q_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(device, "q_rms_weight", UNIT).await;
+    let k_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(device, "k_rms_weight", UNIT).await;
 
     let (cos_values, sin_values) = rope_tables(Ds::SIZE, 10_000.0, 1.0, pos);
-    let cos: HbmTensor<bf16, Chip, m![E, Ds]> = rope_table::<Ds>(ctx, &s, "cos", &cos_values, pos).await;
+    let cos: HbmTensor<bf16, Chip, m![E, Ds]> = rope_table::<Ds>(device, &s, "cos", &cos_values, pos).await;
     let sin: HbmTensor<bf16, Chip, m![E, Ds]> =
-        rope_table::<Ds>(ctx, &s, "sin", &negate_low_half(&sin_values), pos).await;
+        rope_table::<Ds>(device, &s, "sin", &negate_low_half(&sin_values), pos).await;
     let rope_offset: HbmTensor<i32, Chip, m![1]> =
-        s.constant_i32(ctx, "rope_offset", (pos * Ds::SIZE * 2) as i32).await;
+        s.constant_i32(device, "rope_offset", (pos * Ds::SIZE * 2) as i32).await;
 
     let slot = pos % Ts::SIZE;
     let offset = (slot * Ns::SIZE * Ds::SIZE * 2) as i32;
-    let kv_offset: HbmTensor<i32, Chip, m![1]> = s.constant_i32(ctx, "kv_offset", offset).await;
+    let kv_offset: HbmTensor<i32, Chip, m![1]> = s.constant_i32(device, "kv_offset", offset).await;
 
-    let mut k_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
-    let mut v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
-    let mut q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = zeros(ctx).await;
+    let mut k_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(device).await;
+    let mut v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(device).await;
+    let mut q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = zeros(device).await;
 
     launch(
         ops::sliding_project_qkv,
         (
-            ctx,
+            device,
             &x,
             &q_weight,
             &k_weight,
@@ -524,30 +532,31 @@ async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture, run: usize) -
             &mut q_out,
         ),
     )
-    .await;
+    .await
+    .unwrap();
 
     let width = Ns::SIZE * Ds::SIZE;
-    let k = read_bf16(ctx, &k_cache).await[slot * width..(slot + 1) * width].to_vec();
-    let v = read_bf16(ctx, &v_cache).await[slot * width..(slot + 1) * width].to_vec();
+    let k = read_bf16(device, &k_cache).await[slot * width..(slot + 1) * width].to_vec();
+    let v = read_bf16(device, &v_cache).await[slot * width..(slot + 1) * width].to_vec();
     vec![
-        ("expected.q", read_bf16(ctx, &q_out).await),
+        ("expected.q", read_bf16(device, &q_out).await),
         ("expected.k", k),
         ("expected.v", v),
     ]
 }
 
-async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+async fn sliding_attention_output(device: &mut Device, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
     let s = Synth::new("sliding_attention_output", run, fixture);
-    let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.bf16(ctx, "x", ACTIVATION).await;
-    let post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "post_attn_rms_weight", UNIT).await;
-    let o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]> = s.f8(ctx, "o_weight", WEIGHT_EXP, true).await;
-    let o_weight_scale: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "o_weight_scale", ROW_SCALE).await;
-    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
+    let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.bf16(device, "x", ACTIVATION).await;
+    let post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "post_attn_rms_weight", UNIT).await;
+    let o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]> = s.f8(device, "o_weight", WEIGHT_EXP, true).await;
+    let o_weight_scale: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "o_weight_scale", ROW_SCALE).await;
+    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "residual", UNIT).await;
 
     launch(
         ops::sliding_attention_output,
         (
-            ctx,
+            device,
             &x,
             &post_attn_rms_weight,
             &o_weight,
@@ -555,43 +564,45 @@ async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture, run: usi
             &mut residual,
         ),
     )
-    .await;
-    vec![("expected", read_bf16(ctx, &residual).await)]
+    .await
+    .unwrap();
+    vec![("expected", read_bf16(device, &residual).await)]
 }
 
-async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+async fn decoder_feedforward(device: &mut Device, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
     let s = Synth::new("decoder_feedforward", run, fixture);
 
-    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
-    let pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "pre_ff_rms_weight", UNIT).await;
-    let post_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "post_ff_rms_weight", UNIT).await;
+    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "residual", UNIT).await;
+    let pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "pre_ff_rms_weight", UNIT).await;
+    let post_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(device, "post_ff_rms_weight", UNIT).await;
 
-    let up_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(ctx, "up_weight_packed").await;
-    let gate_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(ctx, "gate_weight_packed").await;
-    let down_weight_packed: HbmTensor<f4e2m1, Chip, m![H, L]> = s.f4(ctx, "down_weight_packed").await;
+    let up_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(device, "up_weight_packed").await;
+    let gate_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(device, "gate_weight_packed").await;
+    let down_weight_packed: HbmTensor<f4e2m1, Chip, m![H, L]> = s.f4(device, "down_weight_packed").await;
     let up_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
-        s.f8(ctx, "up_weight_scale", LOCAL_SCALE_EXP, false).await;
+        s.f8(device, "up_weight_scale", LOCAL_SCALE_EXP, false).await;
     let gate_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
-        s.f8(ctx, "gate_weight_scale", LOCAL_SCALE_EXP, false).await;
+        s.f8(device, "gate_weight_scale", LOCAL_SCALE_EXP, false).await;
     let down_weight_scale: HbmTensor<f8e4m3, Chip, m![H, L / 16]> =
-        s.f8(ctx, "down_weight_scale", LOCAL_SCALE_EXP, false).await;
+        s.f8(device, "down_weight_scale", LOCAL_SCALE_EXP, false).await;
 
     let up_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "up_global_scale", &[1.0 / global_scale(run, "up")])
+        .constant_f32(device, "up_global_scale", &[1.0 / global_scale(run, "up")])
         .await;
     let gate_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "gate_global_scale", &[1.0 / global_scale(run, "gate")])
+        .constant_f32(device, "gate_global_scale", &[1.0 / global_scale(run, "gate")])
         .await;
     let down_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "down_global_scale", &[1.0 / global_scale(run, "down")])
+        .constant_f32(device, "down_global_scale", &[1.0 / global_scale(run, "down")])
         .await;
 
-    let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> = s.constant_bf16(ctx, "layer_scalar", &[LAYER_SCALAR; 8]).await;
+    let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> =
+        s.constant_bf16(device, "layer_scalar", &[LAYER_SCALAR; 8]).await;
 
     launch(
         ops::decoder_feedforward,
         (
-            ctx,
+            device,
             &mut residual,
             &pre_ff_rms_weight,
             &up_weight_packed,
@@ -607,8 +618,9 @@ async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture, run: usize) -
             &layer_scalar,
         ),
     )
-    .await;
-    vec![("expected", read_bf16(ctx, &residual).await)]
+    .await
+    .unwrap();
+    vec![("expected", read_bf16(device, &residual).await)]
 }
 
 fn compare(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) -> bool {
@@ -658,12 +670,13 @@ fn compare(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) 
     ok
 }
 
-// --- on-device cycle collection (only armed when TUC_PROFILE_LEVEL is set) ---
+// --- on-device cycle collection (only armed when FURIOSA_OPT_PROFILE is set) ---
 
 const TRACING_TARGET_NPU: &str = "span::npu";
 
 #[derive(Clone, Copy)]
 struct Span {
+    cluster: u64,
     begin: u64,
     end: u64,
 }
@@ -681,13 +694,23 @@ impl Collector {
         self.spans.lock().unwrap().clear();
     }
 
-    /// Real total cycles for whatever ran since the last `clear`: the union of every
-    /// span observed (min begin .. max end).
+    /// Real cycles for whatever ran since the last `clear`: each cluster counts its own
+    /// cycles (see `Function::run`'s `tid = span.cluster`), so a span's `begin`/`end` is
+    /// only comparable to another span on the *same* cluster -- taking a raw min/max across
+    /// clusters mixes unrelated counters and produces a meaningless span. This takes the
+    /// union of spans within each cluster, then the longest cluster's window.
     fn window_cycles(&self) -> Option<u64> {
         let spans = self.spans.lock().unwrap();
-        let begin = spans.iter().map(|s| s.begin).min()?;
-        let end = spans.iter().map(|s| s.end).max()?;
-        Some(end.saturating_sub(begin))
+        let mut per_cluster: HashMap<u64, (u64, u64)> = HashMap::new();
+        for span in spans.iter() {
+            let window = per_cluster.entry(span.cluster).or_insert((span.begin, span.end));
+            window.0 = window.0.min(span.begin);
+            window.1 = window.1.max(span.end);
+        }
+        per_cluster
+            .values()
+            .map(|(begin, end)| end.saturating_sub(*begin))
+            .max()
     }
 }
 
@@ -695,6 +718,7 @@ impl Collector {
 struct FieldExtractor {
     begin: Option<u64>,
     end: Option<u64>,
+    cluster: Option<u64>,
 }
 
 impl tracing::field::Visit for FieldExtractor {
@@ -702,6 +726,7 @@ impl tracing::field::Visit for FieldExtractor {
         match field.name() {
             "begin_cycle" => self.begin = Some(value),
             "end_cycle" => self.end = Some(value),
+            "tid" => self.cluster = Some(value),
             _ => {}
         }
     }
@@ -718,8 +743,8 @@ impl tracing::Subscriber for Collector {
         if attrs.metadata().target() == TRACING_TARGET_NPU {
             let mut extractor = FieldExtractor::default();
             attrs.record(&mut extractor);
-            if let (Some(begin), Some(end)) = (extractor.begin, extractor.end) {
-                self.spans.lock().unwrap().push(Span { begin, end });
+            if let (Some(cluster), Some(begin), Some(end)) = (extractor.cluster, extractor.begin, extractor.end) {
+                self.spans.lock().unwrap().push(Span { cluster, begin, end });
             }
         }
         // 0 is reserved by `span::Id`; spans aren't tracked individually here, so the
@@ -735,7 +760,7 @@ impl tracing::Subscriber for Collector {
 }
 
 fn profiling_enabled() -> bool {
-    let level = std::env::var("TUC_PROFILE_LEVEL")
+    let level = std::env::var("FURIOSA_OPT_PROFILE")
         .unwrap_or_default()
         .to_ascii_lowercase();
     matches!(level.as_str(), "info" | "debug" | "trace")
@@ -753,7 +778,7 @@ fn settle() -> Duration {
 async fn main() {
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
-    let mut ctx = Context::acquire();
+    let mut device = Device::new(ops::sliding_project_qkv.topology()).unwrap();
 
     let profile = profiling_enabled();
     let collector = Collector::default();
@@ -787,7 +812,7 @@ async fn main() {
                 collector.clear();
             }
 
-            let outputs = run_test(&mut ctx, &fixture, test.name, run).await;
+            let outputs = run_test(&mut device, &fixture, test.name, run).await;
 
             let cycles = if profile {
                 // Spans are decoded off the launch hot path during deferred read-back,

@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::Chip;
@@ -10,10 +9,10 @@ pub(crate) type Slice = m![1 # 256];
 pub(crate) type Replicated = m![Dummy256];
 
 pub(crate) fn broadcast_hidden(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![H]> {
-    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![H]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![H]> = device
         .main
         .begin(x.view())
         .fetch::<m![1], m![H]>()
@@ -26,10 +25,10 @@ pub(crate) fn broadcast_hidden(
 }
 
 pub(crate) fn broadcast_sliding_heads(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Qs]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![Qs]> {
-    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Qs]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Qs]> = device
         .main
         .begin(x.view())
         .fetch::<m![1], m![Qs]>()
@@ -42,10 +41,10 @@ pub(crate) fn broadcast_sliding_heads(
 }
 
 pub(crate) fn broadcast_full_heads(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Qf]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![Qf]> {
-    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Qf]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Qf]> = device
         .main
         .begin(x.view())
         .fetch::<m![1], m![Qf]>()

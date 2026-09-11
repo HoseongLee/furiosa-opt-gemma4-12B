@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Ds, Gs, Ns};
@@ -8,11 +7,11 @@ use crate::{Chip, EPS};
 const DS_F32: f32 = Ds::SIZE as f32;
 
 pub(crate) fn normalize_query<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Gs, Ds]>,
     rms_weight: &HbmTensor<bf16, Chip, m![Ds]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Gs, Ds]> {
-    let mean_square: DmTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = ctx
+    let mean_square: DmTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = device
         .main
         .begin(x.view())
         .fetch::<m![Ns, Gs, Ds / 16], m![Ds % 16]>()
@@ -32,7 +31,7 @@ pub(crate) fn normalize_query<Cluster: M, Slice: M>(
         .commit_trim::<m![Gs % 2]>()
         .commit();
 
-    let rms: DmTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = ctx
+    let rms: DmTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = device
         .main
         .begin(mean_square.view())
         .fetch::<m![Ns / 4], m![Ns % 4, Gs]>()
@@ -46,16 +45,17 @@ pub(crate) fn normalize_query<Cluster: M, Slice: M>(
         .commit_trim::<m![Ns % 4, Gs]>()
         .commit();
 
-    let weight_vrf = load_norm_weight::<Cluster, Slice>(ctx, rms_weight);
+    let weight_vrf = load_norm_weight::<Cluster, Slice>(device, rms_weight);
 
-    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = ctx
+    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![Ns, Gs]> = device
         .sub
         .begin(rms.view())
         .fetch::<m![Ns / 4], m![Ns % 4, Gs]>()
         .collect::<m![Ns / 4], m![Ns % 4, Gs]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Ns, Gs, Ds / 16], m![Ds % 16]>()
         .fetch_cast::<f32>()
@@ -73,12 +73,13 @@ pub(crate) fn normalize_query<Cluster: M, Slice: M>(
 }
 
 fn load_norm_weight<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     rms_weight: &HbmTensor<bf16, Chip, m![Ds]>,
 ) -> VrfTensor<f32, Chip, Cluster, Slice, m![Ds]> {
-    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Ds]> = rms_weight.to_dm(&mut ctx.tdma);
+    let weight_dm: DmTensor<bf16, Chip, Cluster, Slice, m![Ds]> = rms_weight.to_dm(&mut device.tdma);
 
-    ctx.sub
+    device
+        .sub
         .begin(weight_dm.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
         .fetch_cast::<f32>()
@@ -87,10 +88,10 @@ fn load_norm_weight<Cluster: M, Slice: M>(
 }
 
 fn root_mean_square<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
 ) -> VrfTensor<f32, Chip, Cluster, Slice, m![Ns]> {
-    let mean_square: DmTensor<f32, Chip, Cluster, Slice, m![Ns]> = ctx
+    let mean_square: DmTensor<f32, Chip, Cluster, Slice, m![Ns]> = device
         .main
         .begin(x.view())
         .fetch::<m![Ns, Ds / 16], m![Ds % 16]>()
@@ -110,7 +111,7 @@ fn root_mean_square<Cluster: M, Slice: M>(
         .commit_trim::<m![Ns % 2]>()
         .commit();
 
-    let rms: DmTensor<f32, Chip, Cluster, Slice, m![Ns]> = ctx
+    let rms: DmTensor<f32, Chip, Cluster, Slice, m![Ns]> = device
         .main
         .begin(mean_square.view())
         .fetch::<m![1], m![Ns]>()
@@ -124,7 +125,8 @@ fn root_mean_square<Cluster: M, Slice: M>(
         .commit_trim::<m![Ns]>()
         .commit();
 
-    ctx.sub
+    device
+        .sub
         .begin(rms.view())
         .fetch::<m![1], m![Ns]>()
         .collect::<m![1], m![Ns]>()
@@ -132,12 +134,13 @@ fn root_mean_square<Cluster: M, Slice: M>(
 }
 
 fn scale_by_rms_and_weight<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
     rms_vrf: &VrfTensor<f32, Chip, Cluster, Slice, m![Ns]>,
     weight_vrf: &VrfTensor<f32, Chip, Cluster, Slice, m![Ds]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> {
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Ns, Ds / 16], m![Ds % 16]>()
         .fetch_cast::<f32>()
@@ -155,11 +158,12 @@ fn scale_by_rms_and_weight<Cluster: M, Slice: M>(
 }
 
 fn scale_by_rms<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
     rms_vrf: &VrfTensor<f32, Chip, Cluster, Slice, m![Ns]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> {
-    ctx.main
+    device
+        .main
         .begin(x.view())
         .fetch::<m![Ns, Ds / 16], m![Ds % 16]>()
         .fetch_cast::<f32>()
@@ -176,21 +180,21 @@ fn scale_by_rms<Cluster: M, Slice: M>(
 }
 
 pub(crate) fn normalize_key(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
     rms_weight: &HbmTensor<bf16, Chip, m![Ds]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> {
-    let rms_vrf = root_mean_square(ctx, x);
-    let weight_vrf = load_norm_weight::<Cluster, Slice>(ctx, rms_weight);
+    let rms_vrf = root_mean_square(device, x);
+    let weight_vrf = load_norm_weight::<Cluster, Slice>(device, rms_weight);
 
-    scale_by_rms_and_weight(ctx, x, &rms_vrf, &weight_vrf)
+    scale_by_rms_and_weight(device, x, &rms_vrf, &weight_vrf)
 }
 
 pub(crate) fn normalize_value(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Ns, Ds]> {
-    let rms_vrf = root_mean_square(ctx, x);
+    let rms_vrf = root_mean_square(device, x);
 
-    scale_by_rms(ctx, x, &rms_vrf)
+    scale_by_rms(device, x, &rms_vrf)
 }

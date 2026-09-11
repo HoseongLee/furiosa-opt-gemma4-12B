@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::Chip;
@@ -12,13 +11,13 @@ pub(crate) type LogitSlices = m![W / 512 % 16, W / 16384];
 pub(crate) type LogitsPerSlice = m![W % 512];
 
 pub(crate) fn logits(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
     weight: &HbmTensor<bf16, Chip, m![W, H]>,
 ) -> DmTensor<bf16, Chip, Cluster, LogitSlices, LogitsPerSlice> {
     let mut logits: DmTensor<bf16, Chip, Cluster, VocabRows, m![W / 16384, W % 32]> = DmTensor::new();
 
-    let x: DmTensor<bf16, Chip, Cluster, VocabRows, m![H]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, VocabRows, m![H]> = device
         .main
         .begin(x.view())
         .fetch::<m![H / 16], m![H % 16]>()
@@ -26,7 +25,7 @@ pub(crate) fn logits(
         .collect::<m![H / 16], m![H % 16]>()
         .commit_trim::<m![H % 16]>()
         .commit();
-    let x_trf: TrfTensor<bf16, Chip, Cluster, VocabRows, m![1], m![H]> = ctx
+    let x_trf: TrfTensor<bf16, Chip, Cluster, VocabRows, m![1], m![H]> = device
         .sub
         .begin(x.view())
         .fetch::<m![H / 16], m![H % 16]>()
@@ -39,9 +38,10 @@ pub(crate) fn logits(
         let weight_dm: DmTensor<bf16, Chip, Cluster, VocabRows, m![W % 32, H]> = weight
             .view()
             .tile::<m![W / 16384], 1, m![1 # 16, W % 16384, H]>(i)
-            .to_dm(&mut ctx.tdma);
+            .to_dm(&mut device.tdma);
 
-        ctx.main
+        device
+            .main
             .begin(weight_dm.view())
             .fetch::<m![W % 32, H / 16], m![H % 16]>()
             .collect::<m![W % 32, H / 16], m![H % 16]>()
@@ -55,7 +55,8 @@ pub(crate) fn logits(
             .commit_view(logits.view_mut().tile::<m![W / 16384], 1, m![1 #{!} 16, W % 32]>(i));
     }
 
-    ctx.main
+    device
+        .main
         .begin(logits.view())
         .fetch::<m![W / 16384], m![W % 32]>()
         .switch::<LogitSlices, m![W / 32 % 16]>(SwitchConfig::InterTranspose {

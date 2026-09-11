@@ -1,4 +1,3 @@
-
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -87,17 +86,17 @@ pub struct Model {
 }
 
 async fn load_bf16<E: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
 ) -> Result<HbmTensor<bf16, Chip, E>, Box<dyn std::error::Error>> {
     let view = tensors.tensor(name)?;
     let host: HostTensor<bf16, E> = HostTensor::from_safetensors(&view).map_err(|error| format!("{name}: {error}"))?;
-    Ok(host.to_hbm(&mut ctx.pdma).await)
+    Ok(host.to_hbm(&mut device.pdma).await?)
 }
 
 async fn load_scalar_bf16(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
 ) -> Result<HbmTensor<bf16, Chip, m![1 # 8]>, Box<dyn std::error::Error>> {
@@ -106,12 +105,12 @@ async fn load_scalar_bf16(
         HostTensor::from_safetensors(&view).map_err(|error| format!("{name}: {error}"))?;
     let value = host.into_vec()[0];
     Ok(HostTensor::<bf16, m![1 # 8]>::from_vec(vec![value; 8])
-        .to_hbm(&mut ctx.pdma)
-        .await)
+        .to_hbm(&mut device.pdma)
+        .await?)
 }
 
 async fn load_bf16_column<E: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
 ) -> Result<HbmTensor<bf16, Chip, E>, Box<dyn std::error::Error>> {
@@ -126,22 +125,22 @@ async fn load_bf16_column<E: M>(
         .into());
     }
     let host: HostTensor<bf16, E> = HostTensor::from_buf(view.data().to_vec());
-    Ok(host.to_hbm(&mut ctx.pdma).await)
+    Ok(host.to_hbm(&mut device.pdma).await?)
 }
 
 async fn load_f8<E: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
 ) -> Result<HbmTensor<f8e4m3, Chip, E>, Box<dyn std::error::Error>> {
     let view = tensors.tensor(name)?;
     let host: HostTensor<f8e4m3, E> =
         HostTensor::from_safetensors(&view).map_err(|error| format!("{name}: {error}"))?;
-    Ok(host.to_hbm(&mut ctx.pdma).await)
+    Ok(host.to_hbm(&mut device.pdma).await?)
 }
 
 async fn load_f4<E: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
     shape: [usize; 2],
@@ -157,7 +156,7 @@ async fn load_f4<E: M>(
         .into());
     }
     let host: HostTensor<f4e2m1, E> = HostTensor::from_buf(view.data().to_vec());
-    Ok(host.to_hbm(&mut ctx.pdma).await)
+    Ok(host.to_hbm(&mut device.pdma).await?)
 }
 
 fn read_f32(tensors: &safetensors::SafeTensors<'_>, name: &str) -> Result<f32, Box<dyn std::error::Error>> {
@@ -180,14 +179,14 @@ fn reciprocal_global_scale(
 }
 
 async fn load_global_scale(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     name: &str,
 ) -> Result<HbmTensor<f32, Chip, m![1]>, Box<dyn std::error::Error>> {
     let value = reciprocal_global_scale(tensors, name)?;
     Ok(HostTensor::<f32, m![1]>::from_vec(vec![value])
-        .to_hbm(&mut ctx.pdma)
-        .await)
+        .to_hbm(&mut device.pdma)
+        .await?)
 }
 
 pub fn model_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -206,7 +205,7 @@ pub fn model_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 async fn load_mlp_projection<E: M, Es: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     prefix: &str,
     name: &str,
@@ -220,23 +219,25 @@ async fn load_mlp_projection<E: M, Es: M>(
     Box<dyn std::error::Error>,
 > {
     Ok((
-        load_f4(ctx, tensors, &format!("{prefix}.{name}.weight_packed"), shape).await?,
-        load_f8(ctx, tensors, &format!("{prefix}.{name}.weight_scale")).await?,
-        load_global_scale(ctx, tensors, &format!("{prefix}.{name}.weight_global_scale")).await?,
+        load_f4(device, tensors, &format!("{prefix}.{name}.weight_packed"), shape).await?,
+        load_f8(device, tensors, &format!("{prefix}.{name}.weight_scale")).await?,
+        load_global_scale(device, tensors, &format!("{prefix}.{name}.weight_global_scale")).await?,
     ))
 }
 
 async fn load_mlp(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     prefix: &str,
 ) -> Result<MlpWeights, Box<dyn std::error::Error>> {
     let (up_weight_packed, up_weight_scale, up_global_scale) =
-        load_mlp_projection::<m![L, H], m![L, H / 16]>(ctx, tensors, prefix, "up_proj", [L::SIZE, H::SIZE]).await?;
+        load_mlp_projection::<m![L, H], m![L, H / 16]>(device, tensors, prefix, "up_proj", [L::SIZE, H::SIZE]).await?;
     let (gate_weight_packed, gate_weight_scale, gate_global_scale) =
-        load_mlp_projection::<m![L, H], m![L, H / 16]>(ctx, tensors, prefix, "gate_proj", [L::SIZE, H::SIZE]).await?;
+        load_mlp_projection::<m![L, H], m![L, H / 16]>(device, tensors, prefix, "gate_proj", [L::SIZE, H::SIZE])
+            .await?;
     let (down_weight_packed, down_weight_scale, down_global_scale) =
-        load_mlp_projection::<m![H, L], m![H, L / 16]>(ctx, tensors, prefix, "down_proj", [H::SIZE, L::SIZE]).await?;
+        load_mlp_projection::<m![H, L], m![H, L / 16]>(device, tensors, prefix, "down_proj", [H::SIZE, L::SIZE])
+            .await?;
     Ok(MlpWeights {
         up_weight_packed,
         gate_weight_packed,
@@ -251,7 +252,7 @@ async fn load_mlp(
 }
 
 async fn load_common(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     prefix: &str,
 ) -> Result<
@@ -264,67 +265,67 @@ async fn load_common(
     Box<dyn std::error::Error>,
 > {
     Ok((
-        load_bf16(ctx, tensors, &format!("{prefix}.pre_feedforward_layernorm.weight")).await?,
-        load_bf16(ctx, tensors, &format!("{prefix}.post_feedforward_layernorm.weight")).await?,
-        load_bf16(ctx, tensors, &format!("{prefix}.input_layernorm.weight")).await?,
-        load_mlp(ctx, tensors, &format!("{prefix}.mlp")).await?,
+        load_bf16(device, tensors, &format!("{prefix}.pre_feedforward_layernorm.weight")).await?,
+        load_bf16(device, tensors, &format!("{prefix}.post_feedforward_layernorm.weight")).await?,
+        load_bf16(device, tensors, &format!("{prefix}.input_layernorm.weight")).await?,
+        load_mlp(device, tensors, &format!("{prefix}.mlp")).await?,
     ))
 }
 
 async fn load_sliding(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     layer: usize,
 ) -> Result<SlidingLayer, Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}");
-    let (pre_feedforward_norm, post_feedforward_norm, input_norm, mlp) = load_common(ctx, tensors, &prefix).await?;
+    let (pre_feedforward_norm, post_feedforward_norm, input_norm, mlp) = load_common(device, tensors, &prefix).await?;
     Ok(SlidingLayer {
         input_norm,
-        q_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.q_proj.weight")).await?,
-        k_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.k_proj.weight")).await?,
-        v_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.v_proj.weight")).await?,
-        q_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.q_proj.weight_scale")).await?,
-        k_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.k_proj.weight_scale")).await?,
-        v_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.v_proj.weight_scale")).await?,
-        q_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.q_norm.weight")).await?,
-        k_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.k_norm.weight")).await?,
-        post_attention_norm: load_bf16(ctx, tensors, &format!("{prefix}.post_attention_layernorm.weight")).await?,
-        o_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.o_proj.weight")).await?,
-        o_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.o_proj.weight_scale")).await?,
+        q_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.q_proj.weight")).await?,
+        k_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.k_proj.weight")).await?,
+        v_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.v_proj.weight")).await?,
+        q_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.q_proj.weight_scale")).await?,
+        k_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.k_proj.weight_scale")).await?,
+        v_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.v_proj.weight_scale")).await?,
+        q_norm: load_bf16(device, tensors, &format!("{prefix}.self_attn.q_norm.weight")).await?,
+        k_norm: load_bf16(device, tensors, &format!("{prefix}.self_attn.k_norm.weight")).await?,
+        post_attention_norm: load_bf16(device, tensors, &format!("{prefix}.post_attention_layernorm.weight")).await?,
+        o_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.o_proj.weight")).await?,
+        o_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.o_proj.weight_scale")).await?,
         pre_feedforward_norm,
         post_feedforward_norm,
-        layer_scalar: load_scalar_bf16(ctx, tensors, &format!("{prefix}.layer_scalar")).await?,
+        layer_scalar: load_scalar_bf16(device, tensors, &format!("{prefix}.layer_scalar")).await?,
         mlp,
     })
 }
 
 async fn load_full(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
     layer: usize,
 ) -> Result<FullLayer, Box<dyn std::error::Error>> {
     let prefix = format!("model.language_model.layers.{layer}");
-    let (pre_feedforward_norm, post_feedforward_norm, input_norm, mlp) = load_common(ctx, tensors, &prefix).await?;
+    let (pre_feedforward_norm, post_feedforward_norm, input_norm, mlp) = load_common(device, tensors, &prefix).await?;
     Ok(FullLayer {
         input_norm,
-        q_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.q_proj.weight")).await?,
-        k_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.k_proj.weight")).await?,
-        q_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.q_proj.weight_scale")).await?,
-        k_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.k_proj.weight_scale")).await?,
-        q_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.q_norm.weight")).await?,
-        k_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.k_norm.weight")).await?,
-        post_attention_norm: load_bf16(ctx, tensors, &format!("{prefix}.post_attention_layernorm.weight")).await?,
-        o_weight: load_f8(ctx, tensors, &format!("{prefix}.self_attn.o_proj.weight")).await?,
-        o_weight_scale: load_bf16_column(ctx, tensors, &format!("{prefix}.self_attn.o_proj.weight_scale")).await?,
+        q_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.q_proj.weight")).await?,
+        k_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.k_proj.weight")).await?,
+        q_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.q_proj.weight_scale")).await?,
+        k_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.k_proj.weight_scale")).await?,
+        q_norm: load_bf16(device, tensors, &format!("{prefix}.self_attn.q_norm.weight")).await?,
+        k_norm: load_bf16(device, tensors, &format!("{prefix}.self_attn.k_norm.weight")).await?,
+        post_attention_norm: load_bf16(device, tensors, &format!("{prefix}.post_attention_layernorm.weight")).await?,
+        o_weight: load_f8(device, tensors, &format!("{prefix}.self_attn.o_proj.weight")).await?,
+        o_weight_scale: load_bf16_column(device, tensors, &format!("{prefix}.self_attn.o_proj.weight_scale")).await?,
         pre_feedforward_norm,
         post_feedforward_norm,
-        layer_scalar: load_scalar_bf16(ctx, tensors, &format!("{prefix}.layer_scalar")).await?,
+        layer_scalar: load_scalar_bf16(device, tensors, &format!("{prefix}.layer_scalar")).await?,
         mlp,
     })
 }
 
 async fn load_vision(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
 ) -> Result<VisionWeights, Box<dyn std::error::Error>> {
     let pos_embedding_view = tensors.tensor("model.vision_embedder.pos_embedding")?;
@@ -332,46 +333,48 @@ async fn load_vision(
         HostTensor::from_safetensors(&pos_embedding_view).map_err(|error| format!("pos_embedding: {error}"))?;
 
     Ok(VisionWeights {
-        patch_ln1_weight: load_bf16(ctx, tensors, "model.vision_embedder.patch_ln1.weight").await?,
-        patch_ln1_bias: load_bf16(ctx, tensors, "model.vision_embedder.patch_ln1.bias").await?,
-        patch_dense_weight: load_bf16(ctx, tensors, "model.vision_embedder.patch_dense.weight").await?,
-        patch_dense_bias: load_bf16(ctx, tensors, "model.vision_embedder.patch_dense.bias").await?,
-        patch_ln2_weight: load_bf16(ctx, tensors, "model.vision_embedder.patch_ln2.weight").await?,
-        patch_ln2_bias: load_bf16(ctx, tensors, "model.vision_embedder.patch_ln2.bias").await?,
-        pos_norm_weight: load_bf16(ctx, tensors, "model.vision_embedder.pos_norm.weight").await?,
-        pos_norm_bias: load_bf16(ctx, tensors, "model.vision_embedder.pos_norm.bias").await?,
-        embedding_projection_weight: load_bf16(ctx, tensors, "model.embed_vision.embedding_projection.weight").await?,
+        patch_ln1_weight: load_bf16(device, tensors, "model.vision_embedder.patch_ln1.weight").await?,
+        patch_ln1_bias: load_bf16(device, tensors, "model.vision_embedder.patch_ln1.bias").await?,
+        patch_dense_weight: load_bf16(device, tensors, "model.vision_embedder.patch_dense.weight").await?,
+        patch_dense_bias: load_bf16(device, tensors, "model.vision_embedder.patch_dense.bias").await?,
+        patch_ln2_weight: load_bf16(device, tensors, "model.vision_embedder.patch_ln2.weight").await?,
+        patch_ln2_bias: load_bf16(device, tensors, "model.vision_embedder.patch_ln2.bias").await?,
+        pos_norm_weight: load_bf16(device, tensors, "model.vision_embedder.pos_norm.weight").await?,
+        pos_norm_bias: load_bf16(device, tensors, "model.vision_embedder.pos_norm.bias").await?,
+        embedding_projection_weight: load_bf16(device, tensors, "model.embed_vision.embedding_projection.weight")
+            .await?,
         pos_embedding: pos_embedding_host.into_vec(),
     })
 }
 
 async fn load_audio(
-    ctx: &mut Context,
+    device: &mut Device,
     tensors: &safetensors::SafeTensors<'_>,
 ) -> Result<AudioWeights, Box<dyn std::error::Error>> {
     Ok(AudioWeights {
-        embedding_projection_weight: load_bf16(ctx, tensors, "model.embed_audio.embedding_projection.weight").await?,
+        embedding_projection_weight: load_bf16(device, tensors, "model.embed_audio.embedding_projection.weight")
+            .await?,
     })
 }
 
-pub async fn load_model(ctx: &mut Context) -> Result<Model, Box<dyn std::error::Error>> {
+pub async fn load_model(device: &mut Device) -> Result<Model, Box<dyn std::error::Error>> {
     let model_dir = model_dir()?;
     let model_path = model_dir.join("model.safetensors");
     let file = File::open(&model_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
 
-    let embedding_table = load_bf16(ctx, &tensors, "model.language_model.embed_tokens.weight").await?;
-    let final_norm = load_bf16(ctx, &tensors, "model.language_model.norm.weight").await?;
-    let vision = load_vision(ctx, &tensors).await?;
-    let audio = load_audio(ctx, &tensors).await?;
+    let embedding_table = load_bf16(device, &tensors, "model.language_model.embed_tokens.weight").await?;
+    let final_norm = load_bf16(device, &tensors, "model.language_model.norm.weight").await?;
+    let vision = load_vision(device, &tensors).await?;
+    let audio = load_audio(device, &tensors).await?;
 
     let mut layers = Vec::with_capacity(LAYERS);
     for layer in 0..LAYERS {
         if layer % 6 == 5 {
-            layers.push(Layer::Full(load_full(ctx, &tensors, layer).await?));
+            layers.push(Layer::Full(load_full(device, &tensors, layer).await?));
         } else {
-            layers.push(Layer::Sliding(load_sliding(ctx, &tensors, layer).await?));
+            layers.push(Layer::Sliding(load_sliding(device, &tensors, layer).await?));
         }
     }
 

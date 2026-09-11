@@ -15,7 +15,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(backend, values("npu"))', 
 path = "src/lib.rs"
 
 [dependencies]
-furiosa-opt-std = "0.6.0"
+furiosa-opt-std = "0.8.1"
 tokio = { version = "1.29", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 safetensors = "0.4"
 memmap2 = "0.9"

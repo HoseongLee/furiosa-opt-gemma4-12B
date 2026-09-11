@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Aa, Dummy256, H};
@@ -9,10 +8,11 @@ const AA_F32: f32 = Aa::SIZE as f32;
 type HiddenRows = m![H / 120, 1 # 8];
 
 fn mean_square(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![Aa]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(input.view())
         .fetch::<m![Aa / 16], m![Aa % 16]>()
         .fetch_cast::<f32>()
@@ -32,10 +32,11 @@ fn mean_square(
 }
 
 fn rms(
-    ctx: &mut Context,
+    device: &mut Device,
     mean_square: &DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]>,
 ) -> DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> {
-    ctx.main
+    device
+        .main
         .begin(mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
@@ -50,19 +51,20 @@ fn rms(
 }
 
 fn rmsnorm_without_weight(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![Aa]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![Aa]> {
-    let mean_square = mean_square(ctx, input);
-    let rms = rms(ctx, &mean_square);
-    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let mean_square = mean_square(device, input);
+    let rms = rms(device, &mean_square);
+    let rms_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .sub
         .begin(rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(input.view())
         .fetch::<m![Aa / 16], m![Aa % 16]>()
         .fetch_cast::<f32>()
@@ -79,10 +81,10 @@ fn rmsnorm_without_weight(
 }
 
 fn broadcast_audio(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![Aa]>,
 ) -> DmTensor<bf16, Chip, Cluster, Replicated, m![Aa]> {
-    let input: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Aa]> = ctx
+    let input: DmTensor<bf16, Chip, Cluster, m![Dummy256], m![Aa]> = device
         .main
         .begin(input.view())
         .fetch::<m![1], m![Aa]>()
@@ -94,20 +96,21 @@ fn broadcast_audio(
 }
 
 fn partial(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Replicated, m![Aa]>,
     weight: &HbmTensor<bf16, Chip, m![H, Aa]>,
 ) -> DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120]> {
     let input: DmTensorView<'_, bf16, Chip, Cluster, HiddenRows, m![Aa]> = unsafe { input.view().reshape() };
-    let input_trf: TrfTensor<bf16, Chip, Cluster, HiddenRows, m![1], m![Aa]> = ctx
+    let input_trf: TrfTensor<bf16, Chip, Cluster, HiddenRows, m![1], m![Aa]> = device
         .sub
         .begin(input)
         .fetch::<m![1], m![Aa]>()
         .collect::<m![Aa / 16], m![Aa % 16]>()
         .to_trf();
-    let weight: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120, Aa]> = weight.to_dm(&mut ctx.tdma);
+    let weight: DmTensor<bf16, Chip, Cluster, HiddenRows, m![H % 120, Aa]> = weight.to_dm(&mut device.tdma);
 
-    ctx.main
+    device
+        .main
         .begin(weight.view())
         .fetch::<m![H % 120, Aa / 16], m![Aa % 16]>()
         .collect::<m![H % 120, Aa / 16], m![Aa % 16]>()
@@ -122,15 +125,16 @@ fn partial(
 }
 
 pub(crate) fn project_frame(
-    ctx: &mut Context,
+    device: &mut Device,
     input: &DmTensor<bf16, Chip, Cluster, Slice, m![Aa]>,
     weight: &HbmTensor<bf16, Chip, m![H, Aa]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
-    let normalized = rmsnorm_without_weight(ctx, input);
-    let input = broadcast_audio(ctx, &normalized);
-    let p = partial(ctx, &input, weight);
+    let normalized = rmsnorm_without_weight(device, input);
+    let input = broadcast_audio(device, &normalized);
+    let p = partial(device, &input, weight);
 
-    ctx.main
+    device
+        .main
         .begin(p.view())
         .fetch::<m![H / 8 % 15], m![H % 8 # 16]>()
         .switch::<Slice, m![H / 8 % 15, H / 120]>(SwitchConfig::Broadcast1 { slice1: 32, slice0: 8 })

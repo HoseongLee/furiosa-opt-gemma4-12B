@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::Chip;
@@ -11,7 +10,7 @@ pub(crate) type UpGateRows = m![L / 60];
 pub(crate) type UpGateRowsPaired = m![L / 120, 1 # 2];
 
 pub(crate) fn project_up_and_gate(
-    ctx: &mut Context,
+    device: &mut Device,
     x_trf: &TrfTensor<bf16, Chip, Cluster, UpGateRows, m![1], m![H]>,
     up_weight_packed: &HbmTensor<f4e2m1, Chip, m![L, H]>,
     gate_weight_packed: &HbmTensor<f4e2m1, Chip, m![L, H]>,
@@ -28,8 +27,8 @@ pub(crate) fn project_up_and_gate(
     let mut up: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60]> = DmTensor::new();
 
     let up_weight_packed: DmTensor<f4e2m1, Chip, Cluster, UpGateRows, m![L % 60, H]> =
-        up_weight_packed.to_dm(&mut ctx.tdma);
-    let up_weight_packed: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H]> = ctx
+        up_weight_packed.to_dm(&mut device.tdma);
+    let up_weight_packed: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H]> = device
         .main
         .begin(up_weight_packed.view())
         .fetch::<m![L % 60], m![H]>()
@@ -39,10 +38,10 @@ pub(crate) fn project_up_and_gate(
         .commit();
 
     let up_weight_scale: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H / 16]> =
-        up_weight_scale.to_dm(&mut ctx.tdma);
+        up_weight_scale.to_dm(&mut device.tdma);
 
     for i in 0..PASSES {
-        let up_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRows, m![L % 60 = 4, H / 16]> = ctx
+        let up_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRows, m![L % 60 = 4, H / 16]> = device
             .sub
             .begin(
                 up_weight_scale
@@ -54,7 +53,7 @@ pub(crate) fn project_up_and_gate(
             .collect::<m![L % 60 = 4, H / 16 / 8], m![H / 16 % 8]>()
             .to_vrf();
 
-        let up_weight: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60 = 4, H]> = ctx
+        let up_weight: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60 = 4, H]> = device
             .main
             .begin(
                 up_weight_packed
@@ -74,7 +73,8 @@ pub(crate) fn project_up_and_gate(
             .commit_trim::<m![H % 8]>()
             .commit();
 
-        ctx.main
+        device
+            .main
             .begin(up_weight.view())
             .fetch::<m![L % 60 = 4, H / 16], m![H % 16]>()
             .collect::<m![L % 60 = 4, H / 16], m![H % 16]>()
@@ -91,8 +91,8 @@ pub(crate) fn project_up_and_gate(
     let mut gate: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60]> = DmTensor::new();
 
     let gate_weight_packed: DmTensor<f4e2m1, Chip, Cluster, UpGateRows, m![L % 60, H]> =
-        gate_weight_packed.to_dm(&mut ctx.tdma);
-    let gate_weight_packed: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H]> = ctx
+        gate_weight_packed.to_dm(&mut device.tdma);
+    let gate_weight_packed: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H]> = device
         .main
         .begin(gate_weight_packed.view())
         .fetch::<m![L % 60], m![H]>()
@@ -102,10 +102,10 @@ pub(crate) fn project_up_and_gate(
         .commit();
 
     let gate_weight_scale: DmTensor<f8e4m3, Chip, Cluster, UpGateRows, m![L % 60, H / 16]> =
-        gate_weight_scale.to_dm(&mut ctx.tdma);
+        gate_weight_scale.to_dm(&mut device.tdma);
 
     for i in 0..PASSES {
-        let gate_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRows, m![L % 60 = 4, H / 16]> = ctx
+        let gate_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRows, m![L % 60 = 4, H / 16]> = device
             .sub
             .begin(
                 gate_weight_scale
@@ -117,7 +117,7 @@ pub(crate) fn project_up_and_gate(
             .collect::<m![L % 60 = 4, H / 16 / 8], m![H / 16 % 8]>()
             .to_vrf();
 
-        let gate_weight: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60 = 4, H]> = ctx
+        let gate_weight: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60 = 4, H]> = device
             .main
             .begin(
                 gate_weight_packed
@@ -137,7 +137,8 @@ pub(crate) fn project_up_and_gate(
             .commit_trim::<m![H % 8]>()
             .commit();
 
-        ctx.main
+        device
+            .main
             .begin(gate_weight.view())
             .fetch::<m![L % 60 = 4, H / 16], m![H % 16]>()
             .collect::<m![L % 60 = 4, H / 16], m![H % 16]>()
@@ -155,7 +156,7 @@ pub(crate) fn project_up_and_gate(
 }
 
 pub(crate) fn feedforward(
-    ctx: &mut Context,
+    device: &mut Device,
     x: DmTensor<bf16, Chip, Cluster, Replicated, m![H]>,
     up_weight_packed: &HbmTensor<f4e2m1, Chip, m![L, H]>,
     gate_weight_packed: &HbmTensor<f4e2m1, Chip, m![L, H]>,
@@ -168,7 +169,7 @@ pub(crate) fn feedforward(
     down_global_scale: &HbmTensor<f32, Chip, m![1]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
     let x: DmTensor<bf16, Chip, Cluster, UpGateRows, m![H]> = unsafe { x.reshape() };
-    let x_trf: TrfTensor<bf16, Chip, Cluster, UpGateRows, m![1], m![H]> = ctx
+    let x_trf: TrfTensor<bf16, Chip, Cluster, UpGateRows, m![1], m![H]> = device
         .sub
         .begin(x.view())
         .fetch::<m![H / 16], m![H % 16]>()
@@ -176,27 +177,26 @@ pub(crate) fn feedforward(
         .to_trf();
 
     let (up, gate) = project_up_and_gate(
-        ctx,
+        device,
         &x_trf,
         up_weight_packed,
         gate_weight_packed,
         up_weight_scale,
         gate_weight_scale,
     );
-    let x = geglu(ctx, up, gate, up_global_scale, gate_global_scale);
-    let x = x.to_dm(&mut ctx.tdma);
-    let down = project_down(ctx, &x, down_weight_packed, down_weight_scale);
+    let x = geglu(device, up, gate, up_global_scale, gate_global_scale);
+    let x = x.to_dm(&mut device.tdma);
+    let down = project_down(device, &x, down_weight_packed, down_weight_scale);
 
-    let down_global_scale: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> =
-        down_global_scale.to_dm(&mut ctx.tdma);
-    let down_global_scale_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+    let down_global_scale: DmTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = down_global_scale.to_dm(&mut device.tdma);
+    let down_global_scale_vrf: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = device
         .sub
         .begin(down_global_scale.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    let down: DmTensor<bf16, Chip, Cluster, Slice, m![H]> = ctx
+    let down: DmTensor<bf16, Chip, Cluster, Slice, m![H]> = device
         .main
         .begin(down.view())
         .fetch::<m![H / 16], m![H % 16]>()
@@ -216,13 +216,13 @@ pub(crate) fn feedforward(
 }
 
 pub(crate) fn geglu(
-    ctx: &mut Context,
+    device: &mut Device,
     up: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60]>,
     gate: DmTensor<bf16, Chip, Cluster, UpGateRows, m![L % 60]>,
     up_global_scale: &HbmTensor<f32, Chip, m![1]>,
     gate_global_scale: &HbmTensor<f32, Chip, m![1]>,
 ) -> DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> {
-    let up: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let up: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .main
         .begin(up.view())
         .fetch::<m![L / 4 % 15], m![L % 4 # 16]>()
@@ -232,15 +232,15 @@ pub(crate) fn geglu(
         .commit();
 
     let up_global_scale: DmTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> =
-        up_global_scale.to_dm(&mut ctx.tdma);
-    let up_global_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> = ctx
+        up_global_scale.to_dm(&mut device.tdma);
+    let up_global_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> = device
         .sub
         .begin(up_global_scale.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    let up: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let up: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .main
         .begin(up.view())
         .fetch::<m![1], m![L % 120]>()
@@ -257,15 +257,15 @@ pub(crate) fn geglu(
         .commit();
 
     let gate_global_scale: DmTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> =
-        gate_global_scale.to_dm(&mut ctx.tdma);
-    let gate_global_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> = ctx
+        gate_global_scale.to_dm(&mut device.tdma);
+    let gate_global_scale_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![1 # 8]> = device
         .sub
         .begin(gate_global_scale.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    let gate: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let gate: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .main
         .begin(gate.view())
         .fetch::<m![L / 4 % 15], m![L % 4 # 16]>()
@@ -274,7 +274,7 @@ pub(crate) fn geglu(
         .commit_trim::<m![L % 4]>()
         .commit();
 
-    let gate: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let gate: DmTensor<bf16, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .main
         .begin(gate.view())
         .fetch::<m![1], m![L % 120]>()
@@ -290,7 +290,7 @@ pub(crate) fn geglu(
         .commit_trim::<m![L % 8]>()
         .commit();
 
-    let gelu: DmTensor<f32, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let gelu: DmTensor<f32, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .sub
         .begin(gate.view())
         .fetch::<m![1], m![L % 120]>()
@@ -309,14 +309,15 @@ pub(crate) fn geglu(
         .commit_trim::<m![L % 8]>()
         .commit();
 
-    let gelu_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = ctx
+    let gelu_vrf: VrfTensor<f32, Chip, Cluster, UpGateRowsPaired, m![L % 120]> = device
         .sub
         .begin(gelu.view())
         .fetch::<m![L / 8 % 15], m![L % 8]>()
         .collect::<m![L / 8 % 15], m![L % 8]>()
         .to_vrf();
 
-    ctx.main
+    device
+        .main
         .begin(up.view())
         .fetch::<m![L / 8 % 15], m![L % 8]>()
         .fetch_cast::<f32>()
@@ -337,13 +338,13 @@ pub(crate) type DownRows = m![H / 120, 1 # 8];
 pub(crate) type DownRowsByColumns = m![H / 120, L / 1920];
 
 pub(crate) fn project_down(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, DownRows, m![L]>,
     down_weight_packed: &HbmTensor<f4e2m1, Chip, m![H, L]>,
     down_weight_scale: &HbmTensor<f8e4m3, Chip, m![H, L / 16]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
-    let x: DmTensor<bf16, Chip, Cluster, DownRowsByColumns, m![L % 1920]> = x.to_dm(&mut ctx.tdma);
-    let x_trf: TrfTensor<bf16, Chip, Cluster, DownRowsByColumns, m![1], m![L % 1920]> = ctx
+    let x: DmTensor<bf16, Chip, Cluster, DownRowsByColumns, m![L % 1920]> = x.to_dm(&mut device.tdma);
+    let x_trf: TrfTensor<bf16, Chip, Cluster, DownRowsByColumns, m![1], m![L % 1920]> = device
         .sub
         .begin(x.view())
         .fetch::<m![L / 16 % 120], m![L % 16]>()
@@ -358,7 +359,7 @@ pub(crate) fn project_down(
     let mut down: DmTensor<bf16, Chip, Cluster, DownRows, m![H % 120]> = DmTensor::new();
 
     let down_weight_scale: DmTensor<f8e4m3, Chip, Cluster, DownRows, m![H % 120, L / 16]> =
-        down_weight_scale.to_dm(&mut ctx.tdma);
+        down_weight_scale.to_dm(&mut device.tdma);
 
     for i in 0..PASSES {
         let mut down_weight: DmTensor<bf16, Chip, Cluster, DownRowsByColumns, m![H % 120 = 4, L % 1920]> =
@@ -368,8 +369,8 @@ pub(crate) fn project_down(
             let down_weight_packed: DmTensor<f4e2m1, Chip, Cluster, DownRows, m![H % 120 = 2, L]> = down_weight_packed
                 .view()
                 .tile::<m![H % 120], 2, m![H / 120, H % 120 = 2 # 120, L]>(4 * i + 2 * j)
-                .to_dm(&mut ctx.tdma);
-            let down_weight_packed: DmTensor<f8e4m3, Chip, Cluster, DownRows, m![H % 120 = 2, L]> = ctx
+                .to_dm(&mut device.tdma);
+            let down_weight_packed: DmTensor<f8e4m3, Chip, Cluster, DownRows, m![H % 120 = 2, L]> = device
                 .main
                 .begin(down_weight_packed.view())
                 .fetch::<m![H % 120 = 2], m![L]>()
@@ -378,7 +379,7 @@ pub(crate) fn project_down(
                 .commit_trim::<m![L % 32]>()
                 .commit();
 
-            let down_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, DownRows, m![H % 120 = 2, L / 16]> = ctx
+            let down_weight_scale_vrf: VrfTensor<f32, Chip, Cluster, DownRows, m![H % 120 = 2, L / 16]> = device
                 .sub
                 .begin(
                     down_weight_scale
@@ -390,7 +391,7 @@ pub(crate) fn project_down(
                 .collect::<m![H % 120 = 2, L / 16 / 8], m![L / 16 % 8]>()
                 .to_vrf();
 
-            let down_weight_tile: DmTensor<bf16, Chip, Cluster, DownRows, m![H % 120 = 2, L]> = ctx
+            let down_weight_tile: DmTensor<bf16, Chip, Cluster, DownRows, m![H % 120 = 2, L]> = device
                 .main
                 .begin(down_weight_packed.view())
                 .fetch::<m![H % 120 = 2, L / 32], m![L % 32]>()
@@ -406,17 +407,18 @@ pub(crate) fn project_down(
                 .commit_trim::<m![L % 8]>()
                 .commit();
             let down_weight_tile: DmTensor<bf16, Chip, Cluster, DownRowsByColumns, m![H % 120 = 2, L % 1920]> =
-                down_weight_tile.to_dm(&mut ctx.tdma);
+                down_weight_tile.to_dm(&mut device.tdma);
 
             down_weight_tile.view().to_dm_view(
-                &mut ctx.tdma,
+                &mut device.tdma,
                 down_weight
                     .view_mut()
                     .tile::<m![H % 120 = 4], 2, m![H % 120 = 4 = 2 #{!} 4, L % 1920]>(2 * j),
             );
         }
 
-        ctx.main
+        device
+            .main
             .begin(down_weight.view())
             .fetch::<m![H % 120 = 4, L / 16 % 120], m![L % 16]>()
             .collect::<m![H % 120 = 4, L / 16 % 120], m![L % 16]>()
@@ -433,5 +435,5 @@ pub(crate) fn project_down(
             .commit_view(down.view_mut().tile::<m![H % 120], 4, m![H % 120 = 4 #{!} 120]>(4 * i));
     }
 
-    down.to_dm(&mut ctx.tdma)
+    down.to_dm(&mut device.tdma)
 }

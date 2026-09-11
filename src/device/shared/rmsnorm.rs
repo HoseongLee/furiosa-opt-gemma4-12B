@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::*;
 
 use crate::axes::{Dummy8, H};
@@ -8,15 +7,15 @@ use crate::{Chip, EPS};
 const H_F32: f32 = H::SIZE as f32;
 
 pub(crate) fn normalize<Cluster: M, Slice: M>(
-    ctx: &mut Context,
+    device: &mut Device,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
     rms_weight: &HbmTensor<bf16, Chip, m![H]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
     type ReducingSlices = m![1 # 32, H / 480];
 
-    let x: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> = x.to_dm(&mut ctx.tdma);
+    let x: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> = x.to_dm(&mut device.tdma);
 
-    let mean_square: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = ctx
+    let mean_square: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = device
         .main
         .begin(x.view())
         .fetch::<m![H / 16 % 30], m![H % 16]>()
@@ -33,7 +32,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let reduced_mean_square: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = ctx
+    let reduced_mean_square: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = device
         .main
         .begin(mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -46,7 +45,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit_trim::<m![1 # 8]>()
         .commit();
 
-    let rms: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = ctx
+    let rms: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = device
         .main
         .begin(reduced_mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -61,8 +60,8 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit();
     let rms: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = unsafe { rms.reshape() };
 
-    let weight_dm: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> = rms_weight.to_dm(&mut ctx.tdma);
-    let weight_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = ctx
+    let weight_dm: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> = rms_weight.to_dm(&mut device.tdma);
+    let weight_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = device
         .sub
         .begin(weight_dm.view())
         .fetch::<m![H / 16 % 30], m![H % 16]>()
@@ -70,14 +69,14 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .to_vrf();
 
-    let rms_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = ctx
+    let rms_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = device
         .sub
         .begin(rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    let normalized: DmTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = ctx
+    let normalized: DmTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = device
         .main
         .begin(x.view())
         .fetch::<m![H / 16 % 30], m![H % 16]>()
@@ -93,7 +92,8 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit_trim::<m![H % 8]>()
         .commit();
 
-    ctx.main
+    device
+        .main
         .begin(normalized.view())
         .fetch::<m![1], m![H % 480]>()
         .switch::<Slice, m![H / 480]>(SwitchConfig::Broadcast1 { slice1: 8, slice0: 1 })

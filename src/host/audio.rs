@@ -1,4 +1,3 @@
-
 use furiosa_opt_std::prelude::bf16;
 
 pub const SAMPLE_RATE: u32 = 16_000;

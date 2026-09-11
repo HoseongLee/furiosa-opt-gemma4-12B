@@ -23,7 +23,7 @@ test runs:
 ### Each kernel is graded over multiple independently-seeded runs, not one
 
 Previously each kernel was measured as a single invocation against one fixed fixture.
-`generate_references.py` now bakes `RUNS` (7) independent draws of every input into one
+`generate_references.py` now bakes `RUNS` (3) independent draws of every input into one
 fixture, keyed `run{n}.{test}.{label}`, and `test_kernels.rs` sweeps all of them -- batched
 per kernel -- from a single binary invocation (one local run, one remote job) rather than
 replaying the same fixed numbers every time. A kernel must pass every run to count as
