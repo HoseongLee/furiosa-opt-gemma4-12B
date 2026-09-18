@@ -1,3 +1,25 @@
+//! Kernel fixture test for the 3 decoder-layer kernels in `src/ops.rs`
+//! (`sliding_project_qkv`, `sliding_attention_output`, `decoder_feedforward`) -- the
+//! source of truth for Stage 1 correctness and performance. A `--bin`, not a `[[test]]`:
+//! `cargo furiosa-opt`'s kernel-registry discovery does not pick up `launch()` calls made
+//! from an integration test crate.
+//!
+//! **Inputs are synthesized, not stored.** `ref/fixtures.safetensors` (written by
+//! `scripts/generate_references.py`) carries only expected outputs and per-tensor
+//! checksums; every input is synthesized here from the `prng` module below, which mirrors
+//! `scripts/fixture_prng.py` byte-for-byte. `Synth::verify` checks the synthesized bytes
+//! against the fixture's checksum before any kernel launches, so a divergence between the
+//! two implementations fails immediately by tensor name instead of as a numeric error.
+//!
+//! **Each kernel is graded over `RUNS` independently-seeded configurations, not one.**
+//! Every synthesized value -- activations, weights, scales, the RoPE position -- differs
+//! per run, so a kernel can't special-case whatever the fixture always used to hand it
+//! (`sliding_attention_output`'s `x` was once fixed at exactly `bf16(+1)`/`bf16(-1)`, which
+//! let its consumer get away with a sign-magnitude shortcut). A kernel must pass every run
+//! to count as correct; the score reported per kernel is the *median* cycle count across
+//! the sweep, not any single run's number. Runs execute batched (all of one kernel's runs,
+//! then the next) rather than interleaved -- measured to have equal-or-lower variance.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +73,13 @@ mod prng {
 
     pub fn bf16_uniform(name: &str, count: usize, lo: f32, hi: f32) -> Vec<u8> {
         bf16_uniform_range(name, 0, count, lo, hi)
+    }
+
+    pub fn f32_uniform(name: &str, count: usize, lo: f32, hi: f32) -> Vec<f32> {
+        let seed = name_hash(name);
+        (0..count)
+            .map(|index| lo + (hi - lo) * u01(word(seed, index)))
+            .collect()
     }
 
     pub fn bf16_uniform_range(name: &str, offset: usize, count: usize, lo: f32, hi: f32) -> Vec<u8> {
@@ -120,11 +149,52 @@ const LOCAL_SCALE_EXP: (u8, u8) = (8, 10);
 const ROW_SCALE: (f32, f32) = (0.0, 1e-3);
 const UNIT: (f32, f32) = (0.0, 1.0);
 const RMS_WEIGHT: (f32, f32) = (0.75, 1.25);
+const ACTIVATION: (f32, f32) = (-1.0, 1.0);
+const GLOBAL_SCALE: (f32, f32) = (2048.0, 16384.0);
 
-const POS: usize = 137;
 const LAYER_SCALAR: f32 = 0.375;
 
-const RAW_GLOBAL_SCALES: [f32; 3] = [9600.0, 9600.0, 12928.0];
+/// Independent draws baked into one fixture (`generate_references.py`'s `RUNS`). The
+/// loop lives here rather than in a shell script so a single binary invocation -- one
+/// local run, one remote job -- sweeps all of them; the printed score is the median
+/// across the sweep, not any single run's number.
+///
+/// No warmup discard: a 10-sweep, 270-sample study (2026-09) found no warmup shape in the
+/// per-run cycle counts -- noise was spread evenly across all run positions, and for
+/// `sliding_project_qkv` the first 4 runs were measurably *quieter* than the rest. The
+/// dominant noise source looked like it was between separate process invocations (shared
+/// hardware, thermal, scheduling), not a per-process cold start, so discarding early runs
+/// only cost sample size for no reduction in variance.
+const RUNS: usize = 7;
+
+/// The RoPE/cache-offset position for run `run`. Mirrors `generate_references.py`'s
+/// `_run_pos` exactly; never 0, since an all-zero position makes RoPE the identity
+/// rotation for every frequency -- a single fixed configuration a kernel could
+/// special-case, which is the same shape of bug `x`'s old `+/-1` span was.
+fn pos(run: usize) -> usize {
+    let seed = prng::name_hash(&format!("run{run}.global.pos"));
+    1 + (prng::word(seed, 0) % 2047) as usize
+}
+
+/// Run `run`'s NVFP4 global scale for `{up,gate,down}`, drawn from `GLOBAL_SCALE` rather
+/// than pinned to the real checkpoint's numbers (mirrors `generate_references.py`).
+fn global_scale(run: usize, name: &str) -> f32 {
+    prng::f32_uniform(
+        &format!("run{run}.global.{name}_global_scale"),
+        1,
+        GLOBAL_SCALE.0,
+        GLOBAL_SCALE.1,
+    )[0]
+}
+
+/// The middle value of `RUNS` (odd, so no averaging ambiguity), used for the score a
+/// kernel is graded on instead of any single run's cycle count -- one lucky or unlucky
+/// run shouldn't move the number that matters.
+fn median(values: &[u64]) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
 
 struct Fixture {
     expected: HashMap<String, Vec<f32>>,
@@ -174,8 +244,8 @@ impl Fixture {
         Self { expected, checksums }
     }
 
-    fn expect(&self, test: &str, label: &str) -> &[f32] {
-        let key = format!("{test}.{label}");
+    fn expect(&self, run: usize, test: &str, label: &str) -> &[f32] {
+        let key = format!("run{run}.{test}.{label}");
         self.expected
             .get(&key)
             .unwrap_or_else(|| panic!("fixture has no `{key}` -- regenerate with scripts/generate_references.py"))
@@ -187,7 +257,9 @@ impl Fixture {
             .keys()
             .map(String::as_str)
             .filter(|key| {
-                let test = key.split('.').next().unwrap_or(key);
+                // Keys are `run{N}.{test}.{label}`, and `label` itself may contain a dot
+                // (e.g. `expected.q`), so the test name is specifically the 2nd segment.
+                let test = key.split('.').nth(1).unwrap_or(key);
                 !TESTS.iter().any(|candidate| candidate.name == test)
             })
             .collect();
@@ -198,8 +270,8 @@ impl Fixture {
         );
     }
 
-    fn checksum(&self, test: &str, input: &str) -> u32 {
-        let key = format!("{test}.check.{input}");
+    fn checksum(&self, run: usize, test: &str, input: &str) -> u32 {
+        let key = format!("run{run}.{test}.check.{input}");
         *self.checksums.get(&key).unwrap_or_else(|| {
             panic!("fixture has no checksum `{key}` -- regenerate with scripts/generate_references.py")
         })
@@ -208,20 +280,21 @@ impl Fixture {
 
 struct Synth<'a> {
     test: &'static str,
+    run: usize,
     fixture: &'a Fixture,
 }
 
 impl<'a> Synth<'a> {
-    fn new(test: &'static str, fixture: &'a Fixture) -> Self {
-        Self { test, fixture }
+    fn new(test: &'static str, run: usize, fixture: &'a Fixture) -> Self {
+        Self { test, run, fixture }
     }
 
     fn seed(&self, name: &str) -> String {
-        format!("{}.{}", self.test, name)
+        format!("run{}.{}.{}", self.run, self.test, name)
     }
 
     fn verify(&self, name: &str, storage: &[u8]) {
-        let expected = self.fixture.checksum(self.test, name);
+        let expected = self.fixture.checksum(self.run, self.test, name);
         let actual = prng::checksum(storage, 0);
         assert_eq!(
             actual, expected,
@@ -244,11 +317,6 @@ impl<'a> Synth<'a> {
 
     async fn bf16<E: M>(&self, ctx: &mut Context, name: &str, span: (f32, f32)) -> HbmTensor<bf16, Chip, E> {
         let storage = prng::bf16_uniform(&self.seed(name), E::SIZE, span.0, span.1);
-        self.upload(ctx, name, storage).await
-    }
-
-    async fn signs<E: M>(&self, ctx: &mut Context, name: &str, scale: f32) -> HbmTensor<bf16, Chip, E> {
-        let storage = prng::bf16_signs(&self.seed(name), E::SIZE, scale);
         self.upload(ctx, name, storage).await
     }
 
@@ -388,17 +456,23 @@ const TESTS: &[Test] = &[
     },
 ];
 
-async fn run_test(ctx: &mut Context, fixture: &Fixture, name: &'static str) -> Vec<(&'static str, Vec<f32>)> {
+async fn run_test(
+    ctx: &mut Context,
+    fixture: &Fixture,
+    name: &'static str,
+    run: usize,
+) -> Vec<(&'static str, Vec<f32>)> {
     match name {
-        "sliding_project_qkv" => sliding_project_qkv(ctx, fixture).await,
-        "sliding_attention_output" => sliding_attention_output(ctx, fixture).await,
-        "decoder_feedforward" => decoder_feedforward(ctx, fixture).await,
+        "sliding_project_qkv" => sliding_project_qkv(ctx, fixture, run).await,
+        "sliding_attention_output" => sliding_attention_output(ctx, fixture, run).await,
+        "decoder_feedforward" => decoder_feedforward(ctx, fixture, run).await,
         other => panic!("no shim for test `{other}` -- add one in run_test"),
     }
 }
 
-async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("sliding_project_qkv", fixture);
+async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+    let s = Synth::new("sliding_project_qkv", run, fixture);
+    let pos = pos(run);
 
     let input_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "input_rms_weight", RMS_WEIGHT).await;
     let x: HbmTensor<bf16, Chip, m![H]> = exact_rmsnorm_input(ctx, &s).await;
@@ -412,14 +486,14 @@ async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'sta
     let q_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "q_rms_weight", UNIT).await;
     let k_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "k_rms_weight", UNIT).await;
 
-    let (cos_values, sin_values) = rope_tables(Ds::SIZE, 10_000.0, 1.0, POS);
-    let cos: HbmTensor<bf16, Chip, m![E, Ds]> = rope_table::<Ds>(ctx, &s, "cos", &cos_values, POS).await;
+    let (cos_values, sin_values) = rope_tables(Ds::SIZE, 10_000.0, 1.0, pos);
+    let cos: HbmTensor<bf16, Chip, m![E, Ds]> = rope_table::<Ds>(ctx, &s, "cos", &cos_values, pos).await;
     let sin: HbmTensor<bf16, Chip, m![E, Ds]> =
-        rope_table::<Ds>(ctx, &s, "sin", &negate_low_half(&sin_values), POS).await;
+        rope_table::<Ds>(ctx, &s, "sin", &negate_low_half(&sin_values), pos).await;
     let rope_offset: HbmTensor<i32, Chip, m![1]> =
-        s.constant_i32(ctx, "rope_offset", (POS * Ds::SIZE * 2) as i32).await;
+        s.constant_i32(ctx, "rope_offset", (pos * Ds::SIZE * 2) as i32).await;
 
-    let slot = POS % Ts::SIZE;
+    let slot = pos % Ts::SIZE;
     let offset = (slot * Ns::SIZE * Ds::SIZE * 2) as i32;
     let kv_offset: HbmTensor<i32, Chip, m![1]> = s.constant_i32(ctx, "kv_offset", offset).await;
 
@@ -462,9 +536,9 @@ async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'sta
     ]
 }
 
-async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("sliding_attention_output", fixture);
-    let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.signs(ctx, "x", 1.0).await;
+async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+    let s = Synth::new("sliding_attention_output", run, fixture);
+    let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.bf16(ctx, "x", ACTIVATION).await;
     let post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "post_attn_rms_weight", UNIT).await;
     let o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]> = s.f8(ctx, "o_weight", WEIGHT_EXP, true).await;
     let o_weight_scale: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "o_weight_scale", ROW_SCALE).await;
@@ -485,8 +559,8 @@ async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture) -> Vec<(
     vec![("expected", read_bf16(ctx, &residual).await)]
 }
 
-async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("decoder_feedforward", fixture);
+async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture, run: usize) -> Vec<(&'static str, Vec<f32>)> {
+    let s = Synth::new("decoder_feedforward", run, fixture);
 
     let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
     let pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "pre_ff_rms_weight", UNIT).await;
@@ -503,13 +577,13 @@ async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'sta
         s.f8(ctx, "down_weight_scale", LOCAL_SCALE_EXP, false).await;
 
     let up_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "up_global_scale", &[1.0 / RAW_GLOBAL_SCALES[0]])
+        .constant_f32(ctx, "up_global_scale", &[1.0 / global_scale(run, "up")])
         .await;
     let gate_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "gate_global_scale", &[1.0 / RAW_GLOBAL_SCALES[1]])
+        .constant_f32(ctx, "gate_global_scale", &[1.0 / global_scale(run, "gate")])
         .await;
     let down_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "down_global_scale", &[1.0 / RAW_GLOBAL_SCALES[2]])
+        .constant_f32(ctx, "down_global_scale", &[1.0 / global_scale(run, "down")])
         .await;
 
     let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> = s.constant_bf16(ctx, "layer_scalar", &[LAYER_SCALAR; 8]).await;
@@ -661,7 +735,9 @@ impl tracing::Subscriber for Collector {
 }
 
 fn profiling_enabled() -> bool {
-    let level = std::env::var("TUC_PROFILE_LEVEL").unwrap_or_default().to_ascii_lowercase();
+    let level = std::env::var("TUC_PROFILE_LEVEL")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     matches!(level.as_str(), "info" | "debug" | "trace")
 }
 
@@ -687,53 +763,83 @@ async fn main() {
     let settle = settle();
 
     println!(
-        "NPU kernel tests -- {} cases against a precomputed reference{}\n",
+        "NPU kernel tests -- {} cases x {RUNS} independently-seeded runs against a precomputed reference{}\n",
         TESTS.len(),
         if profile { ", with on-device cycle counts" } else { "" }
     );
 
+    // Batched (all runs of one kernel, then all runs of the next), not interleaved: a
+    // 20-sweep, 420-sample study (2026-09) found interleaving run0 of A/B/C, then run1 of
+    // A/B/C, ... measurably increased variance for 2 of 3 kernels (and tied on the third)
+    // versus running each kernel's whole sweep back to back. Switching between different
+    // kernels' code and access patterns every run looks like it adds noise (icache/branch
+    // predictor churn) rather than removing any bias from slow drift over a sweep.
     let mut failures = Vec::new();
     for test in TESTS {
         if profile {
             println!("==> {}", test.name);
-            collector.clear();
         }
 
-        let outputs = run_test(&mut ctx, &fixture, test.name).await;
+        let mut all_ok = true;
+        let mut cycles_by_run = Vec::with_capacity(RUNS);
+        for run in 0..RUNS {
+            if profile {
+                collector.clear();
+            }
 
-        let cycles = if profile {
-            // Spans are decoded off the launch hot path during deferred read-back, not
-            // synchronously with `run_test(..).await` returning.
-            tokio::time::sleep(settle).await;
-            collector.window_cycles()
-        } else {
-            None
-        };
+            let outputs = run_test(&mut ctx, &fixture, test.name, run).await;
 
-        assert!(
-            !outputs.is_empty(),
-            "{}: shim produced no outputs to compare",
-            test.name
-        );
-        let mut ok = true;
-        for (label, actual) in &outputs {
-            let display = if outputs.len() == 1 {
-                test.name.to_string()
+            let cycles = if profile {
+                // Spans are decoded off the launch hot path during deferred read-back,
+                // not synchronously with `run_test(..).await` returning.
+                tokio::time::sleep(settle).await;
+                collector.window_cycles()
             } else {
-                format!("{} {}", test.name, label.trim_start_matches("expected."))
+                None
             };
-            ok &= compare(&display, fixture.expect(test.name, label), actual, test.atol, test.rtol);
+
+            assert!(
+                !outputs.is_empty(),
+                "{}: shim produced no outputs to compare",
+                test.name
+            );
+            let mut ok = true;
+            for (label, actual) in &outputs {
+                let base = if outputs.len() == 1 {
+                    test.name.to_string()
+                } else {
+                    format!("{} {}", test.name, label.trim_start_matches("expected."))
+                };
+                let display = format!("{base} run{run}");
+                ok &= compare(
+                    &display,
+                    fixture.expect(run, test.name, label),
+                    actual,
+                    test.atol,
+                    test.rtol,
+                );
+            }
+            all_ok &= ok;
+            if let Some(c) = cycles {
+                cycles_by_run.push(c);
+            }
         }
 
         if profile {
-            match cycles {
-                Some(c) => println!("    cycles={c}"),
-                None => println!("    cycles=none observed"),
+            if cycles_by_run.is_empty() {
+                println!("    cycles=none observed");
+            } else {
+                println!(
+                    "    median cycles={} (of {} runs: {:?})",
+                    median(&cycles_by_run),
+                    cycles_by_run.len(),
+                    cycles_by_run
+                );
             }
             println!();
         }
 
-        if !ok {
+        if !all_ok {
             failures.push(test.name);
         }
     }

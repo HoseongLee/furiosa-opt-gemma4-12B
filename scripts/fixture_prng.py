@@ -1,4 +1,4 @@
-"""Byte-exact tensor synthesis, shared with `tests/test_kernels.rs`.
+"""Byte-exact tensor synthesis, shared with `src/bin/test_kernels.rs`.
 
 The fixture that `generate_references.py` writes carries **only expected outputs**. Every
 *input* a kernel test needs -- activations, weights, scales, masks, RoPE tables -- is

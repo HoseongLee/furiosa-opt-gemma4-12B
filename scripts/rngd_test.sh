@@ -4,9 +4,11 @@ set -euo pipefail
 CRATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$CRATE"
 
+PYTHON="${PYTHON:-python3}"
 FIXTURE="ref/fixtures.safetensors"
 POLL_SECONDS="${RNGD_POLL_SECONDS:-5}"
 TIMEOUT="${RNGD_TIMEOUT:-1800}"
+SUBMIT_TIMEOUT="${RNGD_SUBMIT_TIMEOUT:-120}"
 
 build=1
 wait_for_result=1
@@ -19,30 +21,17 @@ for argument in "$@"; do
     esac
 done
 
-find_test_binary() {
-    find target/release/deps -maxdepth 1 -type f -name 'test_kernels-*' ! -name '*.d' -perm -u+x \
-        2>/dev/null | xargs -r ls -t | head -1
-}
+BINARY="target/release/test_kernels"
 
 if [ "$build" -eq 1 ]; then
-    echo "==> building test_kernels (as a cargo test binary)"
-    build_json=$(cargo furiosa-opt test --release --test test_kernels --no-run --message-format=json)
-    BINARY=$(printf '%s\n' "$build_json" \
-        | grep '"kind":\["test"\]' \
-        | grep '"name":"test_kernels"' \
-        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
-        | tail -1)
-    if [ -z "$BINARY" ]; then
-        echo "rngd_test.sh: could not find the built test_kernels binary in cargo's build output" >&2
-        exit 1
-    fi
-else
-    BINARY="$(find_test_binary)"
+    echo "==> building test_kernels (as a --bin, for a populated kernel registry)"
+    cargo furiosa-opt compile
+    cargo furiosa-opt build --release --bin test_kernels
 fi
 
 if [ ! -f "$FIXTURE" ]; then
     echo "rngd_test.sh: $FIXTURE is missing -- generate it first:" >&2
-    echo "    python3 scripts/generate_references.py" >&2
+    echo "    $PYTHON scripts/generate_references.py" >&2
     exit 1
 fi
 for required in "$BINARY" scripts/rngd/remote_entrypoint.sh; do
@@ -62,14 +51,21 @@ chmod +x "$staging/remote_entrypoint.sh" "$staging/test_runtime"
 job_name="${RNGD_JOB_NAME:-rngd_test_$RANDOM}"
 
 echo "==> submitting $job_name ($(du -ch "$staging"/* | tail -1 | cut -f1) total)"
+set +e
 submit_output=$(furiosa-arena submit \
     "$staging/remote_entrypoint.sh" \
     "$staging/test_runtime" \
     "$staging/fixtures.safetensors" \
     --name "$job_name" \
     --entrypoint remote_entrypoint.sh \
-    --timeout "$TIMEOUT" 2>&1)
+    --timeout "$SUBMIT_TIMEOUT" 2>&1)
+submit_status=$?
+set -e
 echo "$submit_output"
+if [ "$submit_status" -ne 0 ]; then
+    echo "rngd_test.sh: furiosa-arena submit failed (exit $submit_status, shown above)" >&2
+    exit 1
+fi
 
 job=$(printf '%s\n' "$submit_output" | sed -n 's/.*submitted job \([0-9][0-9]*\).*/\1/p' | head -1)
 if [ -z "$job" ]; then

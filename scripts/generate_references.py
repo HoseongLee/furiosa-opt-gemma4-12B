@@ -2,7 +2,7 @@
 """Generate `ref/fixtures.safetensors`: the expected output of every decoder-layer kernel
 under test.
 
-`tests/test_kernels.rs` replays these on hardware and compares. This is the only
+`src/bin/test_kernels.rs` replays these on hardware and compares. This is the only
 kernel-test path in the crate.
 
 **The reference is `scripts/reference/gemma4.py`**, this repo's own checkpoint-matched pure-PyTorch
@@ -24,12 +24,18 @@ and stays around 120 KB rather than the ~2.3 GB the inputs would need. A checksu
 synthesized input travels with them so a divergence between the two implementations fails
 by name instead of as a mysterious numeric error.
 
-No checkpoint is required: the config values below are literals, and the three NVFP4
-global scales are the ones read from layer 0 of the real checkpoint.
+No checkpoint is required: the config values below are literals. The fixture bakes in
+`RUNS` independent draws of every value -- including the RoPE position and the NVFP4
+global scales -- keyed `run{n}.{test}.{label}`, so `test_kernels.rs` can sweep all of them
+from one binary invocation instead of replaying the same numbers every time. This is the
+same mechanism `sliding_attention_output` used to fail: a kernel can special-case whatever
+the fixture always hands it, so nothing that reaches a kernel as data should be a single
+fixed value across every run.
 
-Adding a test: write a `gen_*` function that returns `(outputs, checksums)`, add it to
-`TESTS`, and add the matching shim and tolerance row in `tests/test_kernels.rs`. The two
-registries are keyed by the same name and are kept in step by hand.
+Adding a test: write a `gen_*` function that takes a `run: int` and returns
+`(outputs, checksums)`, add it to `TESTS`, and add the matching shim and tolerance row in
+`src/bin/test_kernels.rs`. The two registries are keyed by the same name and are kept in
+step by hand.
 """
 
 import sys
@@ -47,13 +53,18 @@ import gemma4
 CRATE = Path(__file__).resolve().parent.parent
 FIXTURE = CRATE / "ref" / "fixtures.safetensors"
 
+RUNS = 7
+
 H, L, W = 3840, 15360, 262144
 NS, GS, DS, QS, PS, TS = 8, 2, 256, 4096, 2048, 1024
 GF, DF, QF, PF, TF = 16, 512, 8192, 512, 512
 
 EPS = 1e-6
 
-RAW_GLOBAL_SCALES = {"up": 9600.0, "gate": 9600.0, "down": 12928.0}
+GLOBAL_SCALE = (2048.0, 16384.0)
+"""Span for the three NVFP4 global scales. Order-of-magnitude matches the real checkpoint
+(~9600/~9600/~12928) but the actual values are drawn per run rather than pinned to those
+checkpoint numbers, so a submission can't special-case the real constants."""
 
 F4_MAGNITUDES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
@@ -62,8 +73,23 @@ LOCAL_SCALE_EXP = (8, 10)
 ROW_SCALE = (0.0, 1e-3)
 UNIT = (0.0, 1.0)
 RMS_WEIGHT = (0.75, 1.25)
+ACTIVATION = (-1.0, 1.0)
 
-POS = 137
+
+def _run_pos(run: int) -> int:
+    """The RoPE/cache-offset position for run `run`, drawn from the shared PRNG.
+
+    `test_kernels.rs` derives the identical value for the same `run`, and every downstream
+    tensor that depends on it (`cos`, `sin`, `kv_offset`, `rope_offset`) is checksummed, so
+    the two sides failing to agree on `pos` surfaces immediately as a checksum mismatch
+    rather than a silently wrong position. Never 0: an all-zero position makes RoPE the
+    identity rotation for every frequency, which is exactly the kind of single fixed
+    configuration a kernel could special-case.
+    """
+    word = prng.words(f"run{run}.global.pos", 1)[0]
+    return 1 + int(word % np.uint64(2047))
+
+
 LAYER_SCALAR = 0.375
 
 
@@ -73,19 +99,20 @@ def _tensor(storage: np.ndarray, dtype: torch.dtype, shape) -> torch.Tensor:
 
 
 class Synth:
-    """One test's inputs: synthesized from `fixture_prng`, and checksummed.
+    """One (run, test) pair's inputs: synthesized from `fixture_prng`, and checksummed.
 
-    Seeds are namespaced by test name, so every test's tensors are independent and
-    adding or removing a test never moves another's bytes. `test_kernels.rs` builds the
-    identical names.
+    Seeds are namespaced by run and test name, so every run's and every test's tensors are
+    independent -- adding or removing a test, or changing `RUNS`, never moves another
+    tensor's bytes. `test_kernels.rs` builds the identical names.
     """
 
-    def __init__(self, test: str):
+    def __init__(self, test: str, run: int):
         self.test = test
+        self.run = run
         self.checks: dict[str, int] = {}
 
     def _seed(self, name: str) -> str:
-        return f"{self.test}.{name}"
+        return f"run{self.run}.{self.test}.{name}"
 
     def _keep(self, name: str, storage: np.ndarray) -> None:
         self.checks[name] = prng.checksum(storage)
@@ -193,16 +220,30 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, 
     return (x * cos) + (gemma4.rotate_half(x) * sin)
 
 
+_ROPE_SANITY_POS = 137
+"""Position `verify_rope_matches_upstream` checks at -- fixed, unlike `_run_pos`'s.
+
+This check's job is to catch `rope_tables()`'s formula drifting from
+`gemma4.precompute_rope`'s, which is a property of the formula, not of any one position.
+Tying it to a per-run position instead would make it fail intermittently: comparing our f64
+table against `gemma4.precompute_rope`'s native f32 one is an f32-vs-f64 libm comparison,
+which (per `rope_tables`'s docstring) has a real, if small, per-position chance of a
+last-ulp disagreement landing on a bf16 rounding boundary. A fixed position keeps this a
+deterministic regression check instead of a once-in-a-while flake.
+"""
+
+
 def verify_rope_matches_upstream() -> None:
     """Assert our f64 tables are bit-identical to `reference/gemma4.py`'s own f32 RoPE, in bf16."""
     cases = (
         ("sliding_attention", DS, 10_000.0, 1.0),
         ("full_attention", DF, 1_000_000.0, 0.25),
     )
+    pos = _ROPE_SANITY_POS
     for layer_type, head_dim, theta, factor in cases:
-        cos_up, sin_up = gemma4.precompute_rope(head_dim, POS + 1, theta, factor, device="cpu", dtype=torch.bfloat16)
-        cos, sin = rope_tables(head_dim, theta, factor, POS)
-        for label, ours, theirs in (("cos", cos, cos_up[POS]), ("sin", sin, sin_up[POS])):
+        cos_up, sin_up = gemma4.precompute_rope(head_dim, pos + 1, theta, factor, device="cpu", dtype=torch.bfloat16)
+        cos, sin = rope_tables(head_dim, theta, factor, pos)
+        for label, ours, theirs in (("cos", cos, cos_up[pos]), ("sin", sin, sin_up[pos])):
             mine = torch.from_numpy(ours).to(torch.bfloat16)
             if not torch.equal(mine, theirs.to(torch.bfloat16)):
                 raise AssertionError(
@@ -247,14 +288,15 @@ class Capture(dict):
 
 
 
-def gen_sliding_project_qkv():
+def gen_sliding_project_qkv(run: int):
     """`ops::sliding_project_qkv`: input norm -> QKV -> q/k norm -> RoPE -> cache write.
 
     `x` is built as `signs / input_rms_weight` so the normalized activation is exactly
     representable, isolating semantic errors from bf16 drift.
     """
-    s = Synth("sliding_project_qkv")
+    s = Synth("sliding_project_qkv", run)
     keep = Capture()
+    pos = _run_pos(run)
 
     input_rms_weight = s.bf16("input_rms_weight", (H,), RMS_WEIGHT)
     signs = s.signs("x_signs", (H,))
@@ -269,12 +311,12 @@ def gen_sliding_project_qkv():
     q_rms_weight = s.bf16("q_rms_weight", (DS,), UNIT)
     k_rms_weight = s.bf16("k_rms_weight", (DS,), UNIT)
 
-    cos_raw, sin_raw = rope_tables(DS, 10_000.0, 1.0, POS)
+    cos_raw, sin_raw = rope_tables(DS, 10_000.0, 1.0, pos)
     cos = s.constant_bf16("cos", cos_raw).view(1, 1, DS)
     s.constant_bf16("sin", negate_low_half(sin_raw))
     sin = torch.from_numpy(sin_raw).to(torch.bfloat16).view(1, 1, DS)
-    s.constant_i32("kv_offset", (POS % TS) * NS * DS * 2)
-    s.constant_i32("rope_offset", POS * DS * 2)
+    s.constant_i32("kv_offset", (pos % TS) * NS * DS * 2)
+    s.constant_i32("rope_offset", pos * DS * 2)
 
     h = keep("normed", rms_norm(H, input_rms_weight)(x))
 
@@ -292,10 +334,17 @@ def gen_sliding_project_qkv():
     return {"expected.q": keep["q"], "expected.k": keep["k"], "expected.v": keep["v"]}, s.checks
 
 
-def gen_sliding_attention_output():
-    """`ops::sliding_attention_output`: o_proj -> post-attention RMSNorm -> residual."""
-    s = Synth("sliding_attention_output")
-    x = s.signs("x", (NS, GS, DS))
+def gen_sliding_attention_output(run: int):
+    """`ops::sliding_attention_output`: o_proj -> post-attention RMSNorm -> residual.
+
+    `x` stands in for the attention head's real output, so it must be continuously
+    valued like a real activation. It used to be drawn from `signs()` (always exactly
+    `bf16(+1)`/`bf16(-1)`), which let `project_output`'s matmul get away with a
+    sign-magnitude fast path that is exact for `+/-1` operands but wrong in general --
+    the test never exercised anything else.
+    """
+    s = Synth("sliding_attention_output", run)
+    x = s.bf16("x", (NS, GS, DS), ACTIVATION)
     post_rms_weight = s.bf16("post_attn_rms_weight", (H,), UNIT)
     o_codes = s.f8("o_weight", (H, QS), WEIGHT_EXP)
     o_scale = s.bf16("o_weight_scale", (H,), ROW_SCALE)
@@ -323,7 +372,7 @@ class GloballyScaled(torch.nn.Module):
         return (self.linear(x).float() * self.scale).to(x.dtype)
 
 
-def gen_decoder_feedforward():
+def gen_decoder_feedforward(run: int):
     """`ops::decoder_feedforward`: pre-ff norm -> NVFP4 MLP -> post-ff norm -> residual
     -> per-layer gate.
 
@@ -333,7 +382,7 @@ def gen_decoder_feedforward():
     weight here, and one f32 global scale per matrix applied as its reciprocal after the
     contraction.
     """
-    s = Synth("decoder_feedforward")
+    s = Synth("decoder_feedforward", run)
     cfg = gemma4.Gemma4Config()
 
     residual = s.bf16("residual", (H,), UNIT)
@@ -342,18 +391,22 @@ def gen_decoder_feedforward():
     layer_scalar = s.constant_bf16("layer_scalar", np.full(8, LAYER_SCALAR, dtype=np.float32))
 
     weights = {}
+    raw_scales = {}
     for name, out_dim, in_dim in (("up", L, H), ("gate", L, H), ("down", H, L)):
         codes = s.f4(f"{name}_weight_packed", (out_dim, in_dim))
         local = s.f8(f"{name}_weight_scale", (out_dim, in_dim // 16), LOCAL_SCALE_EXP, signed=False)
         weights[name] = codes * local.repeat_interleave(16, dim=-1)
-        s.constant_f32(f"{name}_global_scale", np.array([1.0 / RAW_GLOBAL_SCALES[name]], dtype=np.float32))
+        raw_scales[name] = float(
+            prng.f32_uniform(f"run{run}.global.{name}_global_scale", 1, GLOBAL_SCALE[0], GLOBAL_SCALE[1])[0]
+        )
+        s.constant_f32(f"{name}_global_scale", np.array([1.0 / raw_scales[name]], dtype=np.float32))
 
     mlp = gemma4.MLP(cfg).to(torch.bfloat16)
     with torch.no_grad():
         for name in ("up", "gate", "down"):
             getattr(mlp, f"{name}_proj").weight.copy_(weights[name].to(torch.bfloat16))
         for name in ("up", "gate", "down"):
-            setattr(mlp, f"{name}_proj", GloballyScaled(getattr(mlp, f"{name}_proj"), 1.0 / RAW_GLOBAL_SCALES[name]))
+            setattr(mlp, f"{name}_proj", GloballyScaled(getattr(mlp, f"{name}_proj"), 1.0 / raw_scales[name]))
 
         hidden = rms_norm(H, pre_ff_rms_weight)(residual)
         hidden = rms_norm(H, post_ff_rms_weight)(mlp(hidden))
@@ -373,18 +426,20 @@ def generate() -> None:
     verify_rope_matches_upstream()
 
     entries: dict[str, torch.Tensor] = {}
-    for name, build in TESTS.items():
-        outputs, checks = build()
-        for label, tensor in outputs.items():
-            entries[f"{name}.{label}"] = tensor.detach().float().contiguous()
-        for label, value in checks.items():
-            entries[f"{name}.check.{label}"] = torch.tensor([value], dtype=torch.int64)
-        print(f"  {name:34} {', '.join(outputs)}  ({len(checks)} inputs)")
+    for run in range(RUNS):
+        print(f"run {run}:")
+        for name, build in TESTS.items():
+            outputs, checks = build(run)
+            for label, tensor in outputs.items():
+                entries[f"run{run}.{name}.{label}"] = tensor.detach().float().contiguous()
+            for label, value in checks.items():
+                entries[f"run{run}.{name}.check.{label}"] = torch.tensor([value], dtype=torch.int64)
+            print(f"  {name:34} {', '.join(outputs)}  ({len(checks)} inputs)")
 
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     save_file(entries, str(FIXTURE))
     size = FIXTURE.stat().st_size
-    print(f"\nwrote {FIXTURE.relative_to(CRATE)} ({size / 1e6:.2f} MB, {len(TESTS)} tests)")
+    print(f"\nwrote {FIXTURE.relative_to(CRATE)} ({size / 1e6:.2f} MB, {RUNS} runs x {len(TESTS)} tests)")
 
 
 if __name__ == "__main__":

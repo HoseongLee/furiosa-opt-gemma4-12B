@@ -19,7 +19,8 @@ The three Stage 1 kernels are declared in `src/ops.rs`:
 | `ops::decoder_feedforward` | RMSNorm, GeGLU MLP, post-FF RMSNorm, residual add, and layer gate |
 
 The kernels use the model's existing quantized weights and tensor layouts. Each kernel is
-measured as one invocation for the Stage 1 test.
+measured across 7 independently-seeded input configurations for the Stage 1 test (see
+"Grading criteria" below), not a single fixed invocation.
 
 Stage 2 covers the complete E2E model-serving path except for the public API endpoint in
 `src/api/`. This includes model execution, host orchestration, tokenization, image and
@@ -33,14 +34,17 @@ unknown submission and scoring values are listed explicitly.
 ### Stage 1 — Kernel optimization
 
 Stage 1 is for optimizing the three kernels listed above. A dedicated grading server will
-run the provided `tests/test_kernels.rs` against each submission. This test is the source
+run the provided `src/bin/test_kernels.rs` against each submission. This test is the source
 of truth for Stage 1 correctness and kernel performance.
 
 The Stage 1 test checks:
 
 1. **Buildability:** the allowed code compiles with the competition toolchain.
-2. **Correctness:** all three kernels satisfy the published tolerances.
-3. **Performance:** the test reports real RNGD cycle counts for each kernel.
+2. **Correctness:** each kernel satisfies the published tolerances on every one of 7
+   independently-seeded input configurations, not just one -- a kernel that special-cases
+   a fixed input fails as soon as a different configuration exposes it.
+3. **Performance:** the test reports each kernel's median RNGD cycle count across those 7
+   runs, so one unusually fast or slow run doesn't move the number that's graded.
 
 Stage 1 values to be finalized:
 
@@ -64,7 +68,7 @@ The competition uses one grading policy across both stages. Correctness is a har
 submission that fails a required correctness check receives no performance credit, even if
 it is faster.
 
-For the Stage 1 kernel evaluation, `tests/test_kernels.rs` defines the following tolerances:
+For the Stage 1 kernel evaluation, `src/bin/test_kernels.rs` defines the following tolerances:
 
 | Kernel | Absolute tolerance | Relative tolerance |
 |---|---:|---:|
@@ -73,7 +77,8 @@ For the Stage 1 kernel evaluation, `tests/test_kernels.rs` defines the following
 | `decoder_feedforward` | `0.01` | `1e-2` |
 
 The grading server will measure performance using the official evaluation. The Stage 1 test
-reports RNGD cycle counts for each kernel; the Stage 2 E2E performance metric is TBD.
+reports each kernel's median RNGD cycle count across 7 independently-seeded runs; the
+Stage 2 E2E performance metric is TBD.
 
 The following scoring values are still TBD:
 
@@ -98,7 +103,7 @@ The Stage 1 skeleton is intentionally fixed so that submissions remain comparabl
 2. **Only permitted implementation changes are graded.** Changes to `src/device/` and the
    function bodies in `src/ops.rs` are included in the evaluation. Everything else is
    ignored, including `src/ops_vision.rs`, `src/ops_audio.rs`, `src/axes.rs`, `src/host/`,
-   `src/api/`, `src/bin/`, `src/lib.rs`, and `tests/`.
+   `src/api/`, `src/bin/`, and `src/lib.rs`.
 3. **Keep kernel module paths stable.** `src/ops.rs`, `src/ops_vision.rs`, and
    `src/ops_audio.rs` must remain at the crate root because compiled kernel names include
    `module_path!()`.
